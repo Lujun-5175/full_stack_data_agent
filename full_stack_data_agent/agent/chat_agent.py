@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Legacy host-side chat facade kept only for fallback/reference.
+
+The default analysis path is now `ChatService -> DatabaoRuntime`.
+"""
+
 from databao.agent.configs.llm import LLMConfig
 
 from full_stack_data_agent.agent.models import AgentRequest, AgentResponse, DebugTrace
@@ -53,6 +58,21 @@ class ChatAgent:
                 "Databao host integration uses the copied Databao package with a host-side chat facade.",
             ],
         )
+        debug_detailed = {
+            "agent_request": request.to_dict(),
+            "provider_status": {
+                "provider": request.provider,
+                "model": request.model,
+            },
+            "context_packet": request.context_packet.to_dict(),
+            "debug_trace": {
+                "system_prompt_preview": debug_trace.system_prompt_preview,
+                "message_trace": debug_trace.message_trace,
+                "retrieval_mode": debug_trace.retrieval_mode,
+                "notes": debug_trace.notes,
+            },
+            "llm_result": llm_result.to_dict(),
+        }
         return AgentResponse(
             text=llm_result.content,
             provider=llm_result.provider,
@@ -64,6 +84,7 @@ class ChatAgent:
             debug_trace=debug_trace,
             llm_result=llm_result,
             raw_message_trace=[*message_trace, MessagePayload(role="user", content=request.user_input)],
+            debug_detailed=debug_detailed,
         )
 
     def _build_system_prompt(self, request: AgentRequest) -> str:
@@ -88,5 +109,13 @@ class ChatAgent:
                 "",
                 "Retrieved Context:",
                 retrieved_context or "No retrieved context available.",
+                "",
+                "Uploaded Context:",
+                "\n\n".join(
+                    f"File: {item.file_name}\nSummary: {item.summary}\nSnippets:\n" + "\n".join(item.snippets)
+                    for item in request.context_packet.uploaded_contexts
+                )
+                if request.context_packet.uploaded_contexts
+                else "No uploaded files in this session.",
             ]
         )

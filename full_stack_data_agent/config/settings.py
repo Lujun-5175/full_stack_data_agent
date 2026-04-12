@@ -54,7 +54,7 @@ def get_settings() -> Settings:
         domain_dir=domain_dir,
         ollama_base_url=read("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
         ollama_model=read("OLLAMA_MODEL", "gemma4:e4b"),
-        ollama_timeout=float(read("OLLAMA_TIMEOUT", "60")),
+        ollama_timeout=float(read("OLLAMA_TIMEOUT", "480")),
         ollama_temperature=float(read("OLLAMA_TEMPERATURE", "0.2")),
         ollama_num_ctx=int(read("OLLAMA_NUM_CTX", "8192")),
         context_turn_window=int(read("CONTEXT_TURN_WINDOW", "6")),

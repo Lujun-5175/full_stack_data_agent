@@ -41,4 +41,7 @@ build-backend = "setuptools.build_meta"
 include = ["databao*", "databao_context_engine*", "full_stack_data_agent*"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -m \"not legacy\""
+markers = [
+    "legacy: tests for legacy or fallback-only paths that are not part of the default runtime",
+]

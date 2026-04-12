@@ -44,6 +44,7 @@ class AgentResponse:
     llm_result: LLMChatResult
     raw_message_trace: list[MessagePayload]
     error: str | None = None
+    debug_detailed: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,4 +59,5 @@ class AgentResponse:
             "llm_result": self.llm_result.to_dict(),
             "raw_message_trace": [asdict(message) for message in self.raw_message_trace],
             "error": self.error,
+            "debug_detailed": self.debug_detailed,
         }

@@ -1,7 +1,10 @@
+import pytest
+
 from full_stack_data_agent.config.settings import get_settings
 from full_stack_data_agent.llm.ollama_provider import OllamaProvider
 
 
+@pytest.mark.legacy
 def test_health_check_returns_expected_model() -> None:
     settings = get_settings()
     provider = OllamaProvider(settings)

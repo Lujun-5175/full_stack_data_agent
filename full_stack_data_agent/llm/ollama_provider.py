@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Legacy direct HTTP provider kept for fallback/reference.
+
+The default analysis path is now DatabaoRuntime via Databao LLMConfig.
+"""
+
 import time
 from typing import Any
 

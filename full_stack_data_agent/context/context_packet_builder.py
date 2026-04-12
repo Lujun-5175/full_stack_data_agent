@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Legacy prompt-stuffing context path kept for fallback/reference.
+
+The default analysis path is now Databao domain + DatabaoRuntime.
+"""
+
 from pathlib import Path
 
 from databao_context_engine import init_or_get_dce_domain
@@ -13,6 +18,7 @@ from full_stack_data_agent.context.models import (
     ContextPacket,
     ConversationState,
     RetrievedContextItem,
+    UploadedFileContext,
 )
 
 
@@ -29,6 +35,7 @@ class ContextPacketBuilder:
 
     def build_packet(self, state: ConversationState, latest_user_message: str) -> ContextPacket:
         retrieved_contexts, retrieval_mode, retrieval_error = self._retrieve_context(latest_user_message)
+        uploaded_contexts = self._load_uploaded_contexts(state)
         recent_messages = self._conversation_engine.recent_messages(state)
         recent_user_message = next((message.content for message in reversed(recent_messages) if message.role == "user"), None)
         recent_assistant_message = next(
@@ -39,7 +46,7 @@ class ContextPacketBuilder:
             conversation_id=state.conversation_id,
             turn_count=state.turn_count,
             recent_messages=recent_messages,
-            context_summary=self._conversation_engine.summarize(state),
+            context_summary=self._build_context_summary(state, uploaded_contexts),
             retrieved_contexts=retrieved_contexts,
             debug=ContextDebugInfo(
                 recent_user_message=recent_user_message,
@@ -47,6 +54,7 @@ class ContextPacketBuilder:
                 retrieval_mode=retrieval_mode,
                 retrieval_error=retrieval_error,
             ),
+            uploaded_contexts=uploaded_contexts,
             artifacts={"domain_dir": str(self._settings.domain_dir)},
         )
 
@@ -90,6 +98,29 @@ class ContextPacketBuilder:
 
         domain_manager.build_context(should_index=False, should_enrich_context=False)
         return domain_manager
+
+    def _load_uploaded_contexts(self, state: ConversationState) -> list[UploadedFileContext]:
+        raw_contexts = state.debug_state.get("uploaded_contexts", [])
+        loaded: list[UploadedFileContext] = []
+        for item in raw_contexts:
+            if isinstance(item, UploadedFileContext):
+                loaded.append(item)
+            elif isinstance(item, dict):
+                try:
+                    loaded.append(UploadedFileContext(**item))
+                except TypeError:
+                    continue
+        return loaded
+
+    def _build_context_summary(self, state: ConversationState, uploaded_contexts: list[UploadedFileContext]) -> str:
+        base_summary = self._conversation_engine.summarize(state)
+        if not uploaded_contexts:
+            return base_summary
+        upload_lines = [
+            f"- {item.file_name}: {item.summary[:300]}"
+            for item in uploaded_contexts
+        ]
+        return "\n".join([base_summary, "", "Uploaded Context:", *upload_lines])
 
     def _retrieve_context(self, query: str) -> tuple[list[RetrievedContextItem], str, str | None]:
         try:

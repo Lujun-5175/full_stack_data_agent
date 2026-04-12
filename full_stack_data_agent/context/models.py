@@ -13,11 +13,27 @@ class ConversationMessage:
     created_at: float = field(default_factory=time)
 
 
-@dataclass(frozen=True)
+@dataclass
 class ConversationTurn:
     user_message: ConversationMessage
     assistant_message: ConversationMessage | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    turn_id: str = field(default_factory=lambda: str(uuid4()))
+    debug_detailed: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class UploadedFileContext:
+    file_name: str
+    mime_type: str | None
+    size_bytes: int
+    summary: str
+    snippets: list[str] = field(default_factory=list)
+    extracted_text: str = ""
+    is_tabular: bool = False
+    table_name: str | None = None
+    row_count: int | None = None
+    columns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -31,11 +47,17 @@ class ConversationState:
         return len(self.turns)
 
     def to_dict(self) -> dict[str, Any]:
+        debug_state = {
+            key: [asdict(item) if hasattr(item, "__dataclass_fields__") else item for item in value]
+            if isinstance(value, list)
+            else (asdict(value) if hasattr(value, "__dataclass_fields__") else value)
+            for key, value in self.debug_state.items()
+        }
         return {
             "conversation_id": self.conversation_id,
             "turn_count": self.turn_count,
             "turns": [asdict(turn) for turn in self.turns],
-            "debug_state": self.debug_state,
+            "debug_state": debug_state,
         }
 
 
@@ -63,6 +85,7 @@ class ContextPacket:
     context_summary: str
     retrieved_contexts: list[RetrievedContextItem]
     debug: ContextDebugInfo
+    uploaded_contexts: list[UploadedFileContext] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,6 +95,7 @@ class ContextPacket:
             "recent_messages": [asdict(message) for message in self.recent_messages],
             "context_summary": self.context_summary,
             "retrieved_contexts": [asdict(item) for item in self.retrieved_contexts],
+            "uploaded_contexts": [asdict(item) for item in self.uploaded_contexts],
             "debug": asdict(self.debug),
             "artifacts": self.artifacts,
         }
