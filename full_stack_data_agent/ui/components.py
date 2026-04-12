@@ -429,6 +429,16 @@ def render_quick_diagnostics(status: ProviderHealth, result: Any | None, state: 
     if result and result.last_debug_detailed:
         latency = str(result.last_debug_detailed.get("thread_meta", {}).get("latency_ms", "n/a"))
     runtime_snapshot = result.last_runtime_snapshot if result else {}
+    if status.error:
+        st.markdown(
+            f"""
+            <div class="empty-state empty-state--compact">
+              <div class="empty-state__title">Runtime issue</div>
+              <div class="empty-state__body">{escape(status.error)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     st.markdown(
         f"""
         <div class="diagnostic-grid">

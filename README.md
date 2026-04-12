@@ -33,6 +33,8 @@ ollama pull gemma4:e4b
 
 4. Launch the UI:
 
+- Double-click `Launch Full Stack Data Agent.cmd`, or run:
+
 ```powershell
 & 'C:\Program Files\MySQL\MySQL Shell 8.0\lib\Python3.13\Lib\venv\scripts\nt\python.exe' -m streamlit run full_stack_data_agent/ui/app.py
 ```

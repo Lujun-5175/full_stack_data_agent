@@ -1,23 +1,43 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
-set "ROOT=D:\data_bao\full_stack_data_agent"
-set "PYTHON_EXE=C:\Program Files\MySQL\MySQL Shell 8.0\lib\Python3.13\Lib\venv\scripts\nt\python.exe"
+set "ROOT=%~dp0"
+set "ROOT=%ROOT:~0,-1%"
+
+set "PYTHON_EXE="
+set "PYTHON_ARGS="
+if defined FSDA_PYTHON if exist "%FSDA_PYTHON%" set "PYTHON_EXE=%FSDA_PYTHON%"
+
+if not defined PYTHON_EXE if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+if not defined PYTHON_EXE if exist "%ProgramFiles%\Python313\python.exe" set "PYTHON_EXE=%ProgramFiles%\Python313\python.exe"
+if not defined PYTHON_EXE if exist "%ProgramFiles(x86)%\Python313\python.exe" set "PYTHON_EXE=%ProgramFiles(x86)%\Python313\python.exe"
+if not defined PYTHON_EXE if exist "C:\Program Files\MySQL\MySQL Shell 8.0\lib\Python3.13\Lib\venv\scripts\nt\python.exe" set "PYTHON_EXE=C:\Program Files\MySQL\MySQL Shell 8.0\lib\Python3.13\Lib\venv\scripts\nt\python.exe"
+if not defined PYTHON_EXE for /f "delims=" %%I in ('where python 2^>nul') do if not defined PYTHON_EXE set "PYTHON_EXE=%%I"
+if not defined PYTHON_EXE for /f "delims=" %%I in ('where py 2^>nul') do if not defined PYTHON_EXE (
+  set "PYTHON_EXE=py"
+  set "PYTHON_ARGS=-3.13"
+)
+
+if not defined PYTHON_EXE (
+  echo Could not find a Python interpreter.
+  echo Install Python 3.11+ or set FSDA_PYTHON to the full path of python.exe.
+  pause
+  exit /b 1
+)
 
 cd /d "%ROOT%"
 
-echo Starting Full Stack Data Agent...
-echo.
-echo UI URL: http://127.0.0.1:8501
-echo Provider: ollama
-echo Model: gemma4:e4b
-echo Runtime: editable install from current environment
-echo.
-echo If this is the first run, install dependencies with:
-echo   "%PYTHON_EXE%" -m pip install -e . pytest
+echo Using Python: "%PYTHON_EXE%"
+echo Launching Full Stack Data Agent...
 echo.
 
-start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep 8; Start-Process 'http://127.0.0.1:8501'"
-"%PYTHON_EXE%" -m streamlit run full_stack_data_agent\ui\app.py --global.developmentMode false
+"%PYTHON_EXE%" %PYTHON_ARGS% "%ROOT%\launch_fsda.py"
+set "EXIT_CODE=%ERRORLEVEL%"
 
-endlocal
+if not "%EXIT_CODE%"=="0" (
+  echo.
+  echo Launcher exited with code %EXIT_CODE%.
+  pause
+)
+
+endlocal & exit /b %EXIT_CODE%

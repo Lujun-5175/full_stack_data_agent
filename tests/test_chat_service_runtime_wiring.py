@@ -17,8 +17,8 @@ class FakeRuntime:
             available_models=["gemma4:e4b"],
         )
 
-    def ask(self, conversation_id: str, query: str, *, uploaded_contexts, history_queries):
-        self.ask_calls.append((conversation_id, query, tuple(history_queries)))
+    def ask(self, conversation_id: str, query: str, *, uploaded_contexts):
+        self.ask_calls.append((conversation_id, query))
         return (
             DatabaoTurnResult(
                 text="Databao handled this query.",
@@ -47,3 +47,4 @@ def test_chat_service_uses_databao_runtime() -> None:
     assert result.last_databao_result is not None
     assert result.last_databao_result["used_databao"] is True
     assert state.turns[-1].metadata["used_databao"] is True
+    assert len(fake_runtime.ask_calls[0]) == 2

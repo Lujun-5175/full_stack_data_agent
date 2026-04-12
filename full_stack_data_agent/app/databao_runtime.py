@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 import requests
 
+from full_stack_data_agent.app.dependencies import check_runtime_dependencies
 from full_stack_data_agent.app.runtime_models import DatabaoSessionSnapshot, DatabaoTurnResult, RegisteredTable
 from full_stack_data_agent.config.settings import Settings
 from full_stack_data_agent.context.models import UploadedFileContext
-from full_stack_data_agent.llm.models import ProviderHealth
+from full_stack_data_agent.llm.models import ProviderHealth, ProviderUnavailableError
 
 if TYPE_CHECKING:
     from databao.agent.configs.llm import LLMConfig
@@ -30,6 +31,8 @@ class _DatabaoSession:
     thread: Any
     registered_tables: list[RegisteredTable] = field(default_factory=list)
     context_build_error: str | None = None
+    datasource_changed: bool = False
+    thread_reset_reason: str | None = None
 
 
 class DatabaoRuntime:
@@ -37,8 +40,19 @@ class DatabaoRuntime:
         self._settings = settings
         self._executor_type = executor_type
         self._sessions: dict[str, _DatabaoSession] = {}
+        self._description_registry: dict[str, set[str]] = {}
 
     def provider_status(self) -> ProviderHealth:
+        dependency_status = check_runtime_dependencies()
+        if not dependency_status.is_ok:
+            return ProviderHealth(
+                provider=self._settings.provider_name,
+                base_url=self._settings.ollama_base_url,
+                model=self._settings.ollama_model,
+                connected=False,
+                available_models=[],
+                error=dependency_status.error,
+            )
         try:
             response = requests.get(self._settings.ollama_tags_url, timeout=min(self._settings.ollama_timeout, 10))
             response.raise_for_status()
@@ -70,12 +84,11 @@ class DatabaoRuntime:
         query: str,
         *,
         uploaded_contexts: list[UploadedFileContext] | None = None,
-        history_queries: list[str] | None = None,
     ) -> tuple[DatabaoTurnResult, DatabaoSessionSnapshot]:
+        self._ensure_runtime_ready()
         session = self._ensure_session(
             conversation_id,
             uploaded_contexts=uploaded_contexts or [],
-            history_queries=history_queries or [],
         )
         thread = session.thread.ask(query)
         dataframe = thread.df(rows_limit=200)
@@ -103,14 +116,19 @@ class DatabaoRuntime:
         conversation_id: str,
         *,
         uploaded_contexts: list[UploadedFileContext],
-        history_queries: list[str],
     ) -> _DatabaoSession:
         signature = self._signature(uploaded_contexts)
         existing = self._sessions.get(conversation_id)
         if existing and existing.uploaded_signature == signature:
+            existing.datasource_changed = False
+            existing.thread_reset_reason = None
             return existing
 
-        session = self._build_session(conversation_id, uploaded_contexts=uploaded_contexts, history_queries=history_queries)
+        session = self._build_session(
+            conversation_id,
+            uploaded_contexts=uploaded_contexts,
+            datasource_changed=existing is not None,
+        )
         self._sessions[conversation_id] = session
         return session
 
@@ -119,11 +137,9 @@ class DatabaoRuntime:
         conversation_id: str,
         *,
         uploaded_contexts: list[UploadedFileContext],
-        history_queries: list[str],
+        datasource_changed: bool,
     ) -> _DatabaoSession:
-        from databao.agent import api as bao_api
-
-        domain = bao_api.domain(self._settings.domain_dir)
+        domain = self._create_domain()
         llm_config = self._build_llm_config()
         registered_tables = self._register_uploaded_sources(domain, uploaded_contexts)
         self._add_text_descriptions(domain, uploaded_contexts)
@@ -135,19 +151,11 @@ class DatabaoRuntime:
             except Exception as exc:
                 context_build_error = str(exc)
 
-        agent = bao_api.agent(
+        agent = self._create_agent(
             domain,
-            name="fsda",
-            llm_config=llm_config,
-            executor_type=self._executor_type,
-            stream_ask=False,
-            stream_plot=False,
-            auto_output_modality=True,
+            llm_config,
         )
         thread = agent.thread(cache_scope=f"fsda/{conversation_id}")
-        for previous_query in history_queries:
-            if previous_query.strip():
-                thread.ask(previous_query.strip())
 
         return _DatabaoSession(
             conversation_id=conversation_id,
@@ -157,25 +165,45 @@ class DatabaoRuntime:
             thread=thread,
             registered_tables=registered_tables,
             context_build_error=context_build_error,
+            datasource_changed=datasource_changed,
+            thread_reset_reason="datasource_changed" if datasource_changed else None,
         )
 
     def _build_llm_config(self) -> "LLMConfig":
         from databao.agent.configs.llm import LLMConfig
 
-        use_openai_compatible = bool(self._settings.ollama_base_url)
         model_name = self._settings.ollama_model
-        if not use_openai_compatible and not model_name.startswith(("ollama:", "openai:", "anthropic:")):
+        if not model_name.startswith(("ollama:", "openai:", "anthropic:", "gemini:")):
             model_name = f"ollama:{model_name}"
         return LLMConfig(
             name=model_name,
             temperature=self._settings.ollama_temperature,
             timeout=int(self._settings.ollama_timeout),
-            api_base_url=self._settings.ollama_base_url if use_openai_compatible else None,
+            api_base_url=None,
             use_responses_api=False,
+            ollama_pull_model=False,
             model_kwargs={
                 "num_ctx": self._settings.ollama_num_ctx,
                 "validate_model_on_init": True,
             },
+        )
+
+    def _create_domain(self) -> Any:
+        from databao.agent import api as bao_api
+
+        return bao_api.domain(self._settings.domain_dir)
+
+    def _create_agent(self, domain: Any, llm_config: "LLMConfig") -> Any:
+        from databao.agent import api as bao_api
+
+        return bao_api.agent(
+            domain,
+            name="fsda",
+            llm_config=llm_config,
+            executor_type=self._executor_type,
+            stream_ask=False,
+            stream_plot=False,
+            auto_output_modality=True,
         )
 
     def _register_uploaded_sources(self, domain: Any, uploaded_contexts: list[UploadedFileContext]) -> list[RegisteredTable]:
@@ -199,16 +227,19 @@ class DatabaoRuntime:
         return registered
 
     def _add_text_descriptions(self, domain: Any, uploaded_contexts: list[UploadedFileContext]) -> None:
-        domain.add_description(
-            "Full Stack Data Agent local-first workspace. Use uploaded datasets and existing domain context to answer analysis questions."
+        self._register_description_once(
+            domain,
+            "Full Stack Data Agent local-first workspace. Use uploaded datasets and existing domain context to answer analysis questions.",
         )
         text_contexts = [item for item in uploaded_contexts if not item.is_tabular]
         if text_contexts:
-            description = "\n\n".join(
-                f"Uploaded context file: {item.file_name}\nSummary: {item.summary}\nSnippets:\n" + "\n".join(item.snippets[:3])
-                for item in text_contexts
-            )
-            domain.add_description(description)
+            for item in text_contexts:
+                description = (
+                    f"Uploaded context file: {item.file_name}\nSummary: {item.summary}\nSnippets:\n"
+                    + "\n".join(item.snippets[:3])
+                )
+                dedupe_key = f"text_upload::{item.extracted_text.strip() or item.summary.strip()}"
+                self._register_description_once(domain, description, dedupe_key=dedupe_key)
 
     def _parse_dataframe(self, item: UploadedFileContext) -> pd.DataFrame:
         if not item.extracted_text.strip():
@@ -232,7 +263,25 @@ class DatabaoRuntime:
             executor_type=self._executor_type,
             registered_tables=session.registered_tables,
             context_build_error=session.context_build_error,
+            context_replayed=False,
+            datasource_changed=session.datasource_changed,
+            thread_reset_reason=session.thread_reset_reason,
         )
+
+    def _register_description_once(self, domain: Any, description: str, *, dedupe_key: str | None = None) -> None:
+        domain_key = str(self._settings.domain_dir)
+        seen = self._description_registry.setdefault(domain_key, set())
+        marker = dedupe_key or description
+        if marker in seen:
+            return
+        domain.add_description(description)
+        seen.add(marker)
+
+    def _ensure_runtime_ready(self) -> None:
+        dependency_status = check_runtime_dependencies()
+        if dependency_status.is_ok:
+            return
+        raise ProviderUnavailableError(dependency_status.error or "Missing runtime dependencies.")
 
     @staticmethod
     def _signature(uploaded_contexts: list[UploadedFileContext]) -> tuple[tuple[str, int, str | None], ...]:

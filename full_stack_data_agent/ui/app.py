@@ -256,6 +256,8 @@ def main() -> None:
     _apply_pending_ui_resets()
 
     status = service.provider_status()
+    if status.error:
+        st.error(f"Runtime issue: {status.error}")
     render_shell_header(status, st.session_state.conversation_state, len(st.session_state.uploaded_contexts))
 
     left_col, center_col, right_col = st.columns([0.92, 1.95, 1.08], gap="large")

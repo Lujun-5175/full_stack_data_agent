@@ -52,6 +52,9 @@ class DatabaoSessionSnapshot:
     executor_type: str
     registered_tables: list[RegisteredTable] = field(default_factory=list)
     context_build_error: str | None = None
+    context_replayed: bool = False
+    datasource_changed: bool = False
+    thread_reset_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,4 +63,7 @@ class DatabaoSessionSnapshot:
             "executor_type": self.executor_type,
             "registered_tables": [table.to_dict() for table in self.registered_tables],
             "context_build_error": self.context_build_error,
+            "context_replayed": self.context_replayed,
+            "datasource_changed": self.datasource_changed,
+            "thread_reset_reason": self.thread_reset_reason,
         }

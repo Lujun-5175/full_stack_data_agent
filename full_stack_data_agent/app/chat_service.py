@@ -53,14 +53,12 @@ class ChatService:
         if uploaded_contexts is not None:
             self.set_uploaded_contexts(state, uploaded_contexts)
 
-        history_queries = [turn.user_message.content for turn in state.turns]
         self._conversation_engine.add_user_message(state, user_input)
         try:
             last_result, runtime_snapshot = self._runtime.ask(
                 state.conversation_id,
                 user_input,
                 uploaded_contexts=uploaded_contexts or [],
-                history_queries=history_queries,
             )
             metadata = {
                 "provider": self._settings.provider_name,
@@ -80,6 +78,8 @@ class ChatService:
                 "thread_meta": last_result.thread_meta,
                 "plot_meta": last_result.plot_meta,
                 "used_databao": last_result.used_databao,
+                "thread_reset_reason": runtime_snapshot.thread_reset_reason,
+                "datasource_changed": runtime_snapshot.datasource_changed,
             }
             state.turns[-1].debug_detailed = last_debug_detailed
         except Exception as exc:
