@@ -9,6 +9,7 @@ from io import StringIO
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+from langchain_core.messages import AIMessage, HumanMessage
 
 from full_stack_data_agent.app.dependencies import check_runtime_dependencies
 from full_stack_data_agent.app.normalization import normalize_dataframe
@@ -20,7 +21,7 @@ from full_stack_data_agent.config.provider_resolution import (
     resolve_provider_config,
 )
 from full_stack_data_agent.config.settings import Settings
-from full_stack_data_agent.context.models import UploadedFileContext
+from full_stack_data_agent.context.models import ConversationTurn, UploadedFileContext
 from full_stack_data_agent.context.semantic_profile import build_semantic_profile
 from full_stack_data_agent.llm.models import (
     ProviderAuthError,
@@ -30,6 +31,7 @@ from full_stack_data_agent.llm.models import (
     ProviderTimeoutError,
     ProviderUnavailableError,
 )
+from full_stack_data_agent.utils.text_classification import CHART_INTENT_MARKERS
 
 if TYPE_CHECKING:
     from databao.agent.configs.llm import LLMConfig
@@ -166,6 +168,7 @@ class _DatabaoSession:
     thread: Any
     registered_tables: list[RegisteredTable] = field(default_factory=list)
     context_build_error: str | None = None
+    context_replayed: bool = False
     datasource_changed: bool = False
     thread_reset_reason: str | None = None
 
@@ -214,16 +217,40 @@ class DatabaoRuntime:
             error=active.error,
         )
 
+    def drop_session(self, conversation_id: str) -> None:
+        session = self._sessions.pop(conversation_id, None)
+        if session is None:
+            return
+
+        close_candidates = [
+            getattr(session.agent, "close", None),
+            getattr(getattr(session.agent, "executor", None), "close", None),
+            getattr(getattr(session.agent, "visualizer", None), "close", None),
+            getattr(session.domain, "close", None),
+        ]
+        for close in close_candidates:
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
     def ask(
         self,
         conversation_id: str,
         query: str,
         *,
         uploaded_contexts: list[UploadedFileContext] | None = None,
+        prior_turns: list[ConversationTurn] | None = None,
     ) -> tuple[DatabaoTurnResult, DatabaoSessionSnapshot]:
         self._ensure_runtime_ready()
         uploaded = uploaded_contexts or []
-        session = self._ensure_session(conversation_id, uploaded_contexts=uploaded)
+        history_turns = prior_turns or []
+        session = self._ensure_session(
+            conversation_id,
+            uploaded_contexts=uploaded,
+            prior_turns=history_turns,
+        )
         try:
             result = self._run_turn(session, query)
             return result, self._snapshot(session)
@@ -232,6 +259,7 @@ class DatabaoRuntime:
                 conversation_id,
                 query,
                 uploaded,
+                history_turns,
                 session,
                 exc,
             )
@@ -244,22 +272,39 @@ class DatabaoRuntime:
         conversation_id: str,
         *,
         uploaded_contexts: list[UploadedFileContext],
+        prior_turns: list[ConversationTurn] | None = None,
         provider_name: str | None = None,
     ) -> _DatabaoSession:
         signature = self._signature(uploaded_contexts)
         existing = self._sessions.get(conversation_id)
         target_provider = normalize_provider_name(provider_name or self._settings.llm_provider)
         if existing and existing.uploaded_signature == signature and existing.provider_name == target_provider:
+            existing.context_replayed = False
             existing.datasource_changed = False
             existing.thread_reset_reason = None
             return existing
 
+        replay_turns = prior_turns or []
+        should_replay = (
+            existing is not None
+            and existing.provider_name == target_provider
+            and existing.uploaded_signature != signature
+            and bool(replay_turns)
+        )
         session = self._build_session(
             conversation_id,
             uploaded_contexts=uploaded_contexts,
             datasource_changed=existing is not None,
+            context_replayed=should_replay,
+            thread_reset_reason=(
+                "datasource_rebuilt_with_history_replay"
+                if existing is not None and existing.provider_name == target_provider and existing.uploaded_signature != signature
+                else ("provider_changed" if existing is not None else None)
+            ),
             provider_name=provider_name,
         )
+        if should_replay:
+            self._replay_prior_turns(session, replay_turns)
         if provider_name is None:
             self._sessions[conversation_id] = session
         return session
@@ -270,6 +315,8 @@ class DatabaoRuntime:
         *,
         uploaded_contexts: list[UploadedFileContext],
         datasource_changed: bool,
+        context_replayed: bool = False,
+        thread_reset_reason: str | None = None,
         provider_name: str | None = None,
     ) -> _DatabaoSession:
         domain = self._create_domain()
@@ -297,8 +344,9 @@ class DatabaoRuntime:
             thread=thread,
             registered_tables=registered_tables,
             context_build_error=context_build_error,
+            context_replayed=context_replayed,
             datasource_changed=datasource_changed,
-            thread_reset_reason="datasource_changed" if datasource_changed else None,
+            thread_reset_reason=thread_reset_reason or ("datasource_changed" if datasource_changed else None),
         )
 
     def _build_llm_config(self, provider_name: str | None = None) -> "LLMConfig":
@@ -382,6 +430,11 @@ class DatabaoRuntime:
         thread = session.thread.ask(query)
         dataframe = thread.df(rows_limit=200)
         plot_result, plot_error = self._maybe_collect_plot(thread, query)
+        if plot_result is None and plot_error is None:
+            auto_plot_result = self._auto_visualization_result(thread)
+            if auto_plot_result is not None:
+                plot_result = auto_plot_result
+                chart_requested = True
         thread_meta = thread.meta()
         text, completion_validation = self._complete_response(thread, query, thread.text(), dataframe)
 
@@ -486,6 +539,7 @@ class DatabaoRuntime:
         conversation_id: str,
         query: str,
         uploaded_contexts: list[UploadedFileContext],
+        _prior_turns: list[ConversationTurn],
         session: _DatabaoSession,
         exc: Exception,
     ) -> tuple[DatabaoTurnResult, DatabaoSessionSnapshot] | None:
@@ -501,6 +555,8 @@ class DatabaoRuntime:
             conversation_id,
             uploaded_contexts=uploaded_contexts,
             datasource_changed=session.datasource_changed,
+            context_replayed=False,
+            thread_reset_reason="provider_fallback",
             provider_name=fallback_provider,
         )
         try:
@@ -555,7 +611,7 @@ class DatabaoRuntime:
     @staticmethod
     def _extract_chart_intent(query: str) -> str | None:
         lowered = query.lower()
-        for marker in _CHART_INTENT_MARKERS:
+        for marker in CHART_INTENT_MARKERS:
             if marker in lowered:
                 return marker
         return None
@@ -685,6 +741,24 @@ class DatabaoRuntime:
         if not item.extracted_text.strip():
             raise ValueError(f"Uploaded file {item.file_name} does not contain readable CSV content.")
         return pd.read_csv(StringIO(item.extracted_text))
+
+    def _replay_prior_turns(self, session: _DatabaoSession, prior_turns: list[ConversationTurn]) -> None:
+        replay_messages: list[Any] = []
+        for turn in prior_turns:
+            replay_messages.append(HumanMessage(content=turn.user_message.content))
+            if turn.assistant_message is not None:
+                replay_messages.append(AIMessage(content=turn.assistant_message.content))
+
+        if not replay_messages:
+            return
+
+        cache = session.agent.cache.scoped(f"fsda/{session.conversation_id}")
+        cache.put("state", {"messages": replay_messages})
+
+    @staticmethod
+    def _auto_visualization_result(thread: Any) -> "VisualisationResult | None":
+        auto_vis = getattr(thread, "_visualization_result", None)
+        return auto_vis if auto_vis is not None else None
 
     def _maybe_collect_plot(self, thread: Any, query: str) -> tuple["VisualisationResult | None", str | None]:
         if not self._has_explicit_chart_intent(query):
@@ -835,7 +909,7 @@ class DatabaoRuntime:
             registered_tables=session.registered_tables,
             normalization_reports=[table.normalization_report for table in session.registered_tables],
             context_build_error=session.context_build_error,
-            context_replayed=False,
+            context_replayed=session.context_replayed,
             datasource_changed=session.datasource_changed,
             thread_reset_reason=session.thread_reset_reason,
         )
@@ -857,7 +931,7 @@ class DatabaoRuntime:
 
     def _has_explicit_chart_intent(self, query: str) -> bool:
         lowered = query.lower()
-        return any(marker in lowered for marker in _CHART_INTENT_MARKERS)
+        return any(marker in lowered for marker in CHART_INTENT_MARKERS)
 
     @staticmethod
     def _profile_columns_by_type(column_hints: dict[str, Any], semantic_type: str) -> list[str]:

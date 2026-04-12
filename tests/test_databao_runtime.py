@@ -14,12 +14,36 @@ from full_stack_data_agent.context.semantic_profile import build_semantic_profil
 from full_stack_data_agent.llm.models import ProviderUnavailableError
 
 
+class FakeScopedCache:
+    def __init__(self, store: dict[str, dict[str, dict]]) -> None:
+        self._store = store
+        self._scope = ""
+
+    def put(self, key: str, state: dict) -> None:
+        self._store.setdefault(self._scope, {})[key] = state
+
+    def get(self, key: str, default: dict | None = None) -> dict:
+        return self._store.get(self._scope, {}).get(key, default or {})
+
+    def scoped(self, scope: str):
+        scoped = FakeScopedCache(self._store)
+        scoped._scope = scope
+        return scoped
+
+
 class FakeThread:
-    def __init__(self, dataframe: pd.DataFrame | None = None, *, fail_on_ask: Exception | None = None) -> None:
+    def __init__(
+        self,
+        dataframe: pd.DataFrame | None = None,
+        *,
+        fail_on_ask: Exception | None = None,
+        auto_visualization_result: object | None = None,
+    ) -> None:
         self.queries: list[str] = []
         self.plot_requests: list[str] = []
         self._dataframe = dataframe if dataframe is not None else pd.DataFrame([{"borough": "Queens", "salary": 100}, {"borough": "Bronx", "salary": 80}])
         self._fail_on_ask = fail_on_ask
+        self._visualization_result = auto_visualization_result
 
     def ask(self, query: str):
         if self._fail_on_ask is not None:
@@ -47,6 +71,10 @@ class FakeAgent:
     def __init__(self, thread: FakeThread, llm_name: str = "ollama:gemma4:e4b") -> None:
         self._thread = thread
         self.llm_config = type("Cfg", (), {"name": llm_name})()
+        self.cache = FakeScopedCache({})
+
+    def close(self) -> None:
+        return None
 
     def thread(self, **kwargs):
         return self._thread
@@ -239,6 +267,50 @@ def test_runtime_falls_back_to_ollama_when_primary_provider_raises_provider_erro
         get_settings.cache_clear()
 
 
+def test_runtime_collects_auto_visualization_without_explicit_chart_intent(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    auto_plot = type(
+        "PlotResult",
+        (),
+        {
+            "code": '{"mark":"line"}',
+            "meta": {"kind": "line"},
+            "spec": {"mark": "line"},
+            "spec_df": pd.DataFrame([{"x": 1, "y": 2}, {"x": 2, "y": 3}]),
+        },
+    )()
+    fake_thread = FakeThread(auto_visualization_result=auto_plot)
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask("session-auto-vis", "summarize the trend", uploaded_contexts=[])
+
+    assert result.plot_code == '{"mark":"line"}'
+    assert result.chart_debug["chart_requested"] is True
+    assert result.plot_spec == {"mark": "line"}
+    assert result.plot_data == [{"x": 1, "y": 2}, {"x": 2, "y": 3}]
+
+
+def test_drop_session_removes_cached_runtime_state(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    fake_thread = FakeThread()
+    fake_domain = FakeDomain()
+    fake_agent = FakeAgent(fake_thread)
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: fake_agent)
+
+    runtime.ask("session-drop", "hello", uploaded_contexts=[])
+
+    assert "session-drop" in runtime._sessions
+
+    runtime.drop_session("session-drop")
+
+    assert "session-drop" not in runtime._sessions
+
+
 def test_runtime_normalizes_uploaded_dataframe_before_registration(monkeypatch) -> None:
     runtime = DatabaoRuntime(get_settings())
     fake_thread = FakeThread()
@@ -372,14 +444,16 @@ def test_build_df_description_limits_categorical_examples(monkeypatch) -> None:
     assert len(description) <= 2000
 
 
-def test_no_history_replay_when_datasource_changes(monkeypatch) -> None:
+def test_runtime_replays_history_when_datasource_changes(monkeypatch) -> None:
     runtime = DatabaoRuntime(get_settings())
     first_thread = FakeThread()
     second_thread = FakeThread()
     first_domain = FakeDomain(supports_context=True)
     second_domain = FakeDomain(supports_context=True)
     domains = [first_domain, second_domain]
-    agents = [FakeAgent(first_thread), FakeAgent(second_thread)]
+    first_agent = FakeAgent(first_thread)
+    second_agent = FakeAgent(second_thread)
+    agents = [first_agent, second_agent]
 
     monkeypatch.setattr(
         "full_stack_data_agent.app.databao_runtime.pd.read_csv",
@@ -411,15 +485,34 @@ def test_no_history_replay_when_datasource_changes(monkeypatch) -> None:
         columns=["borough", "salary"],
     )
 
-    runtime.ask("session-2", "show salary by borough", uploaded_contexts=[first_upload])
-    result, snapshot = runtime.ask("session-2", "plot salary by borough", uploaded_contexts=[second_upload])
+    first_result, _ = runtime.ask("session-2", "show salary by borough", uploaded_contexts=[first_upload])
+    prior_turns = [
+        type(
+            "Turn",
+            (),
+            {
+                "user_message": type("Msg", (), {"content": "show salary by borough"})(),
+                "assistant_message": type("Msg", (), {"content": first_result.text})(),
+            },
+        )()
+    ]
+    result, snapshot = runtime.ask(
+        "session-2",
+        "plot salary by borough",
+        uploaded_contexts=[second_upload],
+        prior_turns=prior_turns,
+    )
 
     assert first_thread.queries == ["show salary by borough"]
     assert second_thread.queries == ["plot salary by borough"]
     assert snapshot.datasource_changed is True
-    assert snapshot.context_replayed is False
-    assert snapshot.thread_reset_reason == "datasource_changed"
+    assert snapshot.context_replayed is True
+    assert snapshot.thread_reset_reason == "datasource_rebuilt_with_history_replay"
     assert result.plot_code == '{"mark":"bar"}'
+
+    replay_cache = second_agent.cache.scoped("fsda/session-2").get("state", {})
+    assert replay_cache["messages"][0].content == "show salary by borough"
+    assert replay_cache["messages"][1].content == "analysis complete"
 
 
 def test_domain_descriptions_are_deduped_across_rebuilds(monkeypatch) -> None:

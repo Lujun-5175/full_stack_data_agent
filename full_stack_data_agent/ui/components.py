@@ -156,6 +156,10 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
     plot_spec = response_dict.get("plot_spec")
     plot_data = response_dict.get("plot_data")
     if not plot_spec or not plot_data:
+        chart_debug["chart_failure_stage"] = "history_payload_validation"
+        chart_debug["chart_failure_reason"] = (
+            f"plot_spec={'present' if plot_spec else 'missing'}, plot_data={'present' if plot_data else 'missing'}"
+        )
         return False
 
     try:
@@ -170,6 +174,7 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
     except Exception as exc:
         chart_debug["chart_failure_stage"] = "ui_render_or_layout"
         chart_debug["chart_failure_reason"] = str(exc)
+        chart_debug["plot_spec_dump"] = plot_spec
         st.error(f"Chart render failed: {exc}")
         return False
 
@@ -614,4 +619,35 @@ def render_uploaded_files_panel(uploaded_contexts: list[UploadedFileContext], re
         if profile or normalization_report:
             with st.expander(f"Column profile: {item.file_name}", expanded=False):
                 _render_profile_summary(profile or {}, normalization_report if isinstance(normalization_report, dict) else {})
+
+
+def render_upload_cards(uploaded_contexts: list[UploadedFileContext], *, compact: bool = False) -> None:
+    if not uploaded_contexts:
+        st.markdown(
+            """
+            <div class="empty-state empty-state--compact">
+              <div class="empty-state__title">No uploaded files</div>
+              <div class="empty-state__body">Upload text, markdown, CSV, JSON, or code files to ground the workspace.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    for item in uploaded_contexts:
+        summary = "text context" if not item.is_tabular else f"{item.row_count or 0} rows x {len(item.columns)} cols"
+        if not item.is_tabular:
+            summary = item.summary[:160]
+        st.markdown(
+            f"""
+            <div class="file-card {'file-card--compact' if compact else ''}">
+              <div class="file-card__top">
+                <div class="file-card__name">{escape(item.file_name)}</div>
+                <div class="file-card__status">{'table' if item.is_tabular else 'text'}</div>
+              </div>
+              <div class="file-card__summary">{escape(summary)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 

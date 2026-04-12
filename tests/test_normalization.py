@@ -46,3 +46,20 @@ def test_normalize_dataframe_reports_parse_rates_and_warnings() -> None:
     assert blank_report.skipped_reason
     assert blank_report.parse_success_rate == 0.0
     assert result.warnings
+
+
+def test_normalize_dataframe_handles_all_null_and_single_row_columns() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "all_null": [None],
+            "single_value": ["42"],
+            "single_date": ["2024-01-02"],
+        }
+    )
+
+    result = normalize_dataframe(dataframe)
+
+    assert result.column_type_map["all_null"] == "string"
+    assert result.column_type_map["single_value"] == "numeric"
+    assert result.column_type_map["single_date"] == "time"
+    assert any(item["column"] == "all_null" for item in result.columns_skipped)

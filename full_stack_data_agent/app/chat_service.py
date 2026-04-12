@@ -34,6 +34,9 @@ class ChatService:
     def provider_status(self) -> ProviderHealth:
         return self._runtime.provider_status()
 
+    def drop_session(self, conversation_id: str) -> None:
+        self._runtime.drop_session(conversation_id)
+
     def set_uploaded_contexts(self, state: ConversationState, uploaded_contexts: list[UploadedFileContext]) -> None:
         state.debug_state["uploaded_contexts"] = uploaded_contexts
 
@@ -59,6 +62,7 @@ class ChatService:
                 state.conversation_id,
                 user_input,
                 uploaded_contexts=uploaded_contexts or [],
+                prior_turns=state.turns[:-1],
             )
             metadata = {
                 "provider": last_result.provider_used or provider_status.provider,

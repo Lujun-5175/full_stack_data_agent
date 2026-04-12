@@ -6,31 +6,13 @@ from typing import Any
 
 import pandas as pd
 
-
-_BOOLEAN_MAP = {
-    "true": True,
-    "false": False,
-    "yes": True,
-    "no": False,
-    "y": True,
-    "n": False,
-    "t": True,
-    "f": False,
-    "1": True,
-    "0": False,
-    "on": True,
-    "off": False,
-}
-
-_NUMERIC_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$")
-_INTEGER_RE = re.compile(r"^[+-]?\d+$")
-_DATETIME_HINT_RE = re.compile(
-    r"(?ix)"
-    r"(^\d{4}[-/]\d{1,2}[-/]\d{1,2}([ t]\d{1,2}:\d{2}(:\d{2})?)?$)"
-    r"|(^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$)"
-    r"|(^[a-z]{3,9}\s+\d{1,2},?\s+\d{4}$)"
-    r"|(^\d{4}-\d{2}$)"
+from full_stack_data_agent.utils.text_classification import (
+    BOOLEAN_TOKEN_MAP,
+    DATETIME_HINT_RE,
+    NUMERIC_RE,
+    series_fullmatch,
 )
+_INTEGER_RE = re.compile(r"^[+-]?\d+$")
 _COMMA_NUMERIC_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
 
 
@@ -274,14 +256,14 @@ def _boolean_parse_success(series: pd.Series) -> float:
     if series.empty:
         return 0.0
     normalized = series.astype("string").str.lower()
-    return float(normalized.isin(_BOOLEAN_MAP.keys()).mean())
+    return float(normalized.isin(BOOLEAN_TOKEN_MAP.keys()).mean())
 
 
 def _datetime_parse_success(series: pd.Series) -> tuple[float, float]:
     if series.empty:
         return 0.0, 0.0
     normalized = series.astype("string")
-    datetime_like = _series_fullmatch(normalized, _DATETIME_HINT_RE)
+    datetime_like = series_fullmatch(normalized, DATETIME_HINT_RE)
     if not datetime_like.any():
         return 0.0, float(datetime_like.mean())
     parsed = pd.to_datetime(normalized.where(datetime_like), errors="coerce")
@@ -294,9 +276,9 @@ def _numeric_parse_success(series: pd.Series) -> tuple[float, float, float]:
         return 0.0, 0.0, 0.0
     normalized = series.astype("string").str.replace("\u00A0", " ", regex=False).str.strip()
     normalized = normalized.mask(normalized == "", pd.NA)
-    comma_numeric = _series_fullmatch(normalized, _COMMA_NUMERIC_RE)
+    comma_numeric = series_fullmatch(normalized, _COMMA_NUMERIC_RE)
     normalized = normalized.where(~comma_numeric, normalized.str.replace(",", "", regex=False))
-    numeric_like = _series_fullmatch(normalized, _NUMERIC_RE)
+    numeric_like = series_fullmatch(normalized, NUMERIC_RE)
     if not numeric_like.any():
         return 0.0, float(numeric_like.mean()), 0.0
     parsed = pd.to_numeric(normalized.where(numeric_like), errors="coerce")
@@ -312,7 +294,7 @@ def _numeric_parse_success(series: pd.Series) -> tuple[float, float, float]:
 
 def _coerce_boolean(series: pd.Series) -> pd.Series | None:
     normalized = series.astype("string").str.replace("\u00A0", " ", regex=False).str.strip().str.lower()
-    mapped = normalized.map(_BOOLEAN_MAP)
+    mapped = normalized.map(BOOLEAN_TOKEN_MAP)
     if mapped.notna().sum() == 0:
         return None
     success_rate = mapped.notna().sum() / max(normalized.notna().sum(), 1)
@@ -324,9 +306,9 @@ def _coerce_boolean(series: pd.Series) -> pd.Series | None:
 def _coerce_numeric(series: pd.Series) -> tuple[pd.Series | None, bool]:
     normalized = series.astype("string").str.replace("\u00A0", " ", regex=False).str.strip()
     normalized = normalized.mask(normalized == "", pd.NA)
-    comma_numeric = _series_fullmatch(normalized, _COMMA_NUMERIC_RE)
+    comma_numeric = series_fullmatch(normalized, _COMMA_NUMERIC_RE)
     normalized = normalized.where(~comma_numeric, normalized.str.replace(",", "", regex=False))
-    numeric_like = _series_fullmatch(normalized, _NUMERIC_RE)
+    numeric_like = series_fullmatch(normalized, NUMERIC_RE)
     parsed = pd.to_numeric(normalized.where(numeric_like), errors="coerce")
     if parsed.notna().sum() == 0:
         return None, False
@@ -354,8 +336,3 @@ def _looks_like_key(series: pd.Series, *, numeric_like_ratio: float, integer_lik
     if average_length < 5:
         return False
     return True
-
-
-def _series_fullmatch(series: pd.Series, pattern: re.Pattern[str]) -> pd.Series:
-    values = series.astype("string")
-    return values.map(lambda value: bool(pattern.fullmatch(str(value))) if not pd.isna(value) else False)

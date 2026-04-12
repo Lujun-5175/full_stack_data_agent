@@ -16,16 +16,10 @@ TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".toml", ".p
 
 def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None = None) -> UploadedFileContext | None:
     suffix = Path(file_name).suffix.lower()
-    if suffix and suffix not in TEXT_EXTENSIONS:
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    else:
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
 
     text = text.strip()
     if not text:

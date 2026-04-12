@@ -19,6 +19,7 @@ from databao.agent.core.opa import Opa
 from databao.agent.databases import register_db_in_duckdb
 from databao.agent.executors.frontend.text_frontend import TextStreamFrontend
 from databao.agent.executors.history_cleaning import clean_tool_history
+from full_stack_data_agent.utils.text_classification import EXPLICIT_VISUALIZATION_MARKERS as SHARED_EXPLICIT_VISUALIZATION_MARKERS
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,7 @@ class GraphExecutor(DuckDBExecutor, ABC):
     @staticmethod
     def _has_explicit_visualization_intent(user_query: str) -> bool:
         lowered_query = user_query.lower()
-        return any(keyword in lowered_query for keyword in _EXPLICIT_VISUALIZATION_MARKERS)
+        return any(keyword in lowered_query for keyword in SHARED_EXPLICIT_VISUALIZATION_MARKERS)
 
     @classmethod
     def _executor_tag(cls) -> str:

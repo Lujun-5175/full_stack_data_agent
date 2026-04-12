@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import streamlit as st
 
@@ -20,12 +20,23 @@ from full_stack_data_agent.ui.components import (
 )
 from full_stack_data_agent.ui.theme import get_ui_css
 
+if TYPE_CHECKING:
+    from full_stack_data_agent.app.chat_service import ChatService
+
 
 st.set_page_config(page_title="Full Stack Data Agent", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(get_ui_css(), unsafe_allow_html=True)
 
 settings = get_settings()
-service = bootstrap(settings)
+
+
+@st.cache_resource
+def _create_service() -> "ChatService":
+    """Singleton: survives Streamlit reruns so Databao thread history is preserved."""
+    return bootstrap(settings)
+
+
+service = _create_service()
 
 
 def _init_session_state() -> None:
@@ -97,6 +108,8 @@ def _submit_prompt(prompt: str) -> None:
 
 
 def _clear_chat() -> None:
+    previous_state = st.session_state.conversation_state
+    service.drop_session(previous_state.conversation_id)
     st.session_state.conversation_state = service.create_state()
     st.session_state.last_result = None
     st.session_state.last_prompt = ""

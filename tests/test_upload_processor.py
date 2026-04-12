@@ -28,3 +28,17 @@ def test_process_uploaded_csv_file_keeps_alias_collisions_visible() -> None:
     assert result is not None
     assert result.is_tabular is True
     assert result.semantic_profile["alias_map"]["a_b"] == ["a_b", "a b"]
+
+
+def test_process_uploaded_csv_file_supports_utf8_bom_and_single_row() -> None:
+    result = process_uploaded_file("single.csv", b"\xef\xbb\xbfname,value\nalpha,1\n", "text/csv")
+
+    assert result is not None
+    assert result.is_tabular is True
+    assert result.row_count == 1
+    assert result.columns == ["name", "value"]
+
+
+def test_process_uploaded_file_returns_none_for_empty_or_invalid_utf8() -> None:
+    assert process_uploaded_file("empty.txt", b"   \n") is None
+    assert process_uploaded_file("bad.txt", b"\xff\xfe\x00\x00") is None
