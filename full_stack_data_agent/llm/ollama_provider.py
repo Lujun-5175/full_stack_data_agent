@@ -13,11 +13,13 @@ import requests
 from full_stack_data_agent.config.settings import Settings
 from full_stack_data_agent.llm.base import LLMProvider
 from full_stack_data_agent.llm.models import (
+    ProviderAuthError,
     EmptyResponseError,
     LLMChatResult,
     MessagePayload,
     ModelInfo,
     ModelNotFoundError,
+    ProviderRateLimitError,
     ProviderHealth,
     ProviderProtocolError,
     ProviderTimeoutError,
@@ -35,7 +37,7 @@ class OllamaProvider(LLMProvider):
         try:
             models = self.list_models()
             return ProviderHealth(
-                provider=self._settings.provider_name,
+                provider="ollama",
                 base_url=self._base,
                 model=self._settings.ollama_model,
                 connected=True,
@@ -43,7 +45,7 @@ class OllamaProvider(LLMProvider):
             )
         except Exception as exc:
             return ProviderHealth(
-                provider=self._settings.provider_name,
+                provider="ollama",
                 base_url=self._base,
                 model=self._settings.ollama_model,
                 connected=False,
@@ -110,7 +112,7 @@ class OllamaProvider(LLMProvider):
             raise EmptyResponseError("Ollama returned an empty assistant message.")
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return LLMChatResult(
-            provider=self._settings.provider_name,
+            provider="ollama",
             model=self._settings.ollama_model,
             source="local_ollama",
             content=content.strip(),
@@ -143,5 +145,11 @@ class OllamaProvider(LLMProvider):
                 f"Ollama is unavailable at {self._base}. Start it with `ollama serve`."
             ) from exc
         if response.status_code >= 400:
+            if response.status_code in (401, 403):
+                raise ProviderAuthError(f"Ollama returned {response.status_code}: {response.text}")
+            if response.status_code == 429:
+                raise ProviderRateLimitError(f"Ollama returned {response.status_code}: {response.text}")
+            if response.status_code >= 500:
+                raise ProviderUnavailableError(f"Ollama returned {response.status_code}: {response.text}")
             raise ProviderProtocolError(f"Ollama returned {response.status_code}: {response.text}")
         return response

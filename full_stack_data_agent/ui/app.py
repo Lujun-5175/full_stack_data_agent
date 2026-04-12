@@ -13,16 +13,9 @@ from full_stack_data_agent.context.upload_processor import process_uploaded_file
 from full_stack_data_agent.ui.components import (
     render_context_rail_header,
     render_conversation_history,
-    render_nav_items,
-    render_quick_diagnostics,
-    render_result_panel,
-    render_runtime_snapshot,
     render_shell_header,
-    render_trace_panel,
-    render_turn_overview,
-    render_uploaded_files_panel,
     render_upload_cards,
-    render_workspace_heading,
+    render_registered_tables_panel,
     render_composer_intro,
 )
 from full_stack_data_agent.ui.theme import get_ui_css
@@ -91,7 +84,7 @@ def _submit_prompt(prompt: str) -> None:
         return
 
     st.session_state.last_prompt = message
-    with st.spinner("Running local Gemma 4..."):
+    with st.spinner("Running the active provider..."):
         state, result = service.send_message(
             st.session_state.conversation_state,
             message,
@@ -111,25 +104,10 @@ def _clear_chat() -> None:
     st.toast("Session cleared.")
 
 
-def _use_uploads() -> None:
-    if not st.session_state.uploaded_contexts:
-        st.toast("Upload a file first.")
-        return
-    _submit_prompt("Please use any uploaded files as context and summarize the important points.")
-
-
-def _explain_state() -> None:
-    _submit_prompt("Explain the current conversation state and the uploaded file context.")
-
-
 def _render_left_rail(status: Any) -> None:
     st.markdown('<div class="rail-shell">', unsafe_allow_html=True)
     st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_context_rail_header(status)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_nav_items()
+    render_context_rail_header(status, st.session_state.conversation_state, len(st.session_state.uploaded_contexts))
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="section">', unsafe_allow_html=True)
@@ -155,96 +133,40 @@ def _render_left_rail(status: Any) -> None:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="section">', unsafe_allow_html=True)
-    st.markdown('<div class="panel-title">Runtime Context</div>', unsafe_allow_html=True)
-    render_runtime_snapshot(status, st.session_state.conversation_state, len(st.session_state.uploaded_contexts))
-    with st.expander("Advanced state", expanded=False):
-        raw_state = {
-            "conversation_id": st.session_state.conversation_state.conversation_id,
-            "turn_count": st.session_state.conversation_state.turn_count,
-            "uploaded_files": [asdict(item) for item in st.session_state.uploaded_contexts],
-            "last_prompt": st.session_state.last_prompt,
-        }
-        st.code(json.dumps(raw_state, ensure_ascii=False, indent=2, default=str), language="json")
+    render_registered_tables_panel(st.session_state.last_result)
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-def _render_center_workspace(status: Any) -> None:
+def _render_right_workspace(status: Any) -> None:
     st.markdown('<div class="main-shell">', unsafe_allow_html=True)
 
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_workspace_heading()
+    st.markdown('<div class="section conversation-section">', unsafe_allow_html=True)
+    render_conversation_history(st.session_state.conversation_state, st.session_state.last_result)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    st.markdown('<div class="task-shell section">', unsafe_allow_html=True)
+    st.markdown('<div class="section composer-shell">', unsafe_allow_html=True)
+    if st.session_state.last_result and st.session_state.last_result.last_error:
+        st.error(st.session_state.last_result.last_error)
+    elif not status.connected and not status.fallback_connected:
+        st.warning(f"{status.provider} is disconnected. The workspace is ready, but runs will fail until the runtime is available.")
+    elif not status.connected and status.fallback_connected:
+        st.info(f"{status.provider} is disconnected, but fallback {getattr(status, 'fallback_provider', None) or '--'} is available.")
     render_composer_intro()
     st.text_area(
         "Message",
         key="composer_text",
-        placeholder="Describe the task for the local data agent, reference uploads, or ask for a state explanation...",
-        height=140,
+        placeholder="Ask the agent...",
+        height=132,
         label_visibility="collapsed",
     )
-    action_cols = st.columns([1.18, 1, 0.9, 0.8])
+    action_cols = st.columns([1.0, 0.72])
     if action_cols[0].button("Run", type="primary", use_container_width=True):
         _submit_prompt(st.session_state.composer_text)
         st.rerun()
-    if action_cols[1].button("Use uploads", use_container_width=True):
-        _use_uploads()
-        st.rerun()
-    if action_cols[2].button("Explain state", use_container_width=True):
-        _explain_state()
-        st.rerun()
-    if action_cols[3].button("Clear", use_container_width=True):
+    if action_cols[1].button("Clear", use_container_width=True):
         _clear_chat()
         st.rerun()
-    st.markdown(
-        '<div class="panel-subtitle">Primary action: run the agent. Secondary actions reuse uploads or inspect state without changing the workflow shape.</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    if st.session_state.last_result and st.session_state.last_result.last_error:
-        st.error(st.session_state.last_result.last_error)
-    elif not status.connected:
-        st.warning("Local Ollama is disconnected. The workspace is ready, but runs will fail until the runtime is available.")
-    st.markdown('<div class="history-shell section">', unsafe_allow_html=True)
-    render_conversation_history(st.session_state.conversation_state)
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def _render_right_inspector(status: Any) -> None:
-    st.markdown('<div class="inspector-shell">', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_result_panel(st.session_state.last_result)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_uploaded_files_panel(st.session_state.uploaded_contexts)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_trace_panel(st.session_state.last_result)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_turn_overview(st.session_state.conversation_state)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    render_quick_diagnostics(
-        status,
-        st.session_state.last_result,
-        st.session_state.conversation_state,
-        len(st.session_state.uploaded_contexts),
-    )
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
@@ -256,20 +178,22 @@ def main() -> None:
     _apply_pending_ui_resets()
 
     status = service.provider_status()
-    if status.error:
+    if status.connected:
+        pass
+    elif status.fallback_connected:
+        st.warning(f"Active provider {status.provider} is unavailable; fallback {getattr(status, 'fallback_provider', None) or '--'} is ready.")
+    elif status.error:
         st.error(f"Runtime issue: {status.error}")
     render_shell_header(status, st.session_state.conversation_state, len(st.session_state.uploaded_contexts))
 
-    left_col, center_col, right_col = st.columns([0.92, 1.95, 1.08], gap="large")
+    left_col, right_col = st.columns([0.72, 2.8], gap="large")
     with left_col:
         _render_left_rail(status)
-    with center_col:
-        _render_center_workspace(status)
     with right_col:
-        _render_right_inspector(status)
+        _render_right_workspace(status)
 
     st.caption(
-        f"Databao runtime on {settings.ollama_model} | uploaded tables stay session-scoped | structured text, table, and plot outputs remain inspectable"
+        f"Active provider: {status.provider} | model: {status.model} | fallback: {getattr(status, 'fallback_provider', None) or '--'} | uploaded tables stay session-scoped | structured text, table, and plot outputs remain inspectable"
     )
 
 

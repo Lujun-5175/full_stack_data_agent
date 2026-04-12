@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from full_stack_data_agent.context.semantic_profile import build_semantic_profile
 from full_stack_data_agent.context.models import UploadedFileContext
 
 
@@ -41,6 +42,7 @@ def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None 
     row_count: int | None = None
     columns: list[str] = []
     table_name: str | None = None
+    semantic_profile: dict[str, object] = {}
     if suffix == ".csv" or (mime_type and "csv" in mime_type.lower()):
         try:
             dataframe = pd.read_csv(StringIO(text))
@@ -50,6 +52,7 @@ def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None 
             is_tabular = True
             row_count = int(len(dataframe))
             columns = [str(column) for column in dataframe.columns]
+            semantic_profile = build_semantic_profile(dataframe)
             stem = Path(file_name).stem.lower().replace("-", "_").replace(" ", "_")
             table_name = "".join(char for char in stem if char.isalnum() or char == "_").strip("_") or "uploaded_data"
             if not table_name[0].isalpha():
@@ -76,6 +79,7 @@ def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None 
         table_name=table_name,
         row_count=row_count,
         columns=columns,
+        semantic_profile=semantic_profile if is_tabular else {},
     )
 
 

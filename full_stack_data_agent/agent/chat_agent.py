@@ -17,8 +17,9 @@ class ChatAgent:
     def __init__(self, settings: Settings, provider: LLMProvider):
         self._settings = settings
         self._provider = provider
+        model_name = settings.active_model if settings.provider_name == "deepseek" else f"ollama:{settings.ollama_model}"
         self._llm_config = LLMConfig(
-            name=f"ollama:{settings.ollama_model}",
+            name=model_name,
             temperature=settings.ollama_temperature,
             timeout=int(settings.ollama_timeout),
             use_responses_api=False,
@@ -95,7 +96,7 @@ class ChatAgent:
         return "\n".join(
             [
                 "You are a local Databao-style assistant running entirely on the user's machine.",
-                "Be explicit that your responses come from the local Ollama provider when asked about model origin.",
+                f"Be explicit that your responses come from the active provider ({self._settings.provider_name}) when asked about model origin.",
                 "Use the recent conversation memory first for follow-up questions.",
                 "Use the retrieved project domain context next when it helps answer accurately.",
                 "If the answer depends on missing facts, say what is missing instead of fabricating.",

@@ -620,5 +620,40 @@ def get_ui_css() -> str:
           grid-template-columns: 1fr;
         }
       }
-    </style>
+      </style>
+      <style>
+      .rail-brand__detail {
+        color: var(--soft);
+        font-size: 0.76rem;
+        margin-top: 0.2rem;
+      }
+
+      .main-shell {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .conversation-section {
+        min-height: 62vh;
+      }
+
+      .composer-shell {
+        margin-top: auto;
+        display: grid;
+        gap: 0.8rem;
+      }
+
+      .history-card {
+        margin-bottom: 0.85rem;
+      }
+
+      .history-card--user {
+        border-left: 3px solid var(--accent);
+      }
+
+      .history-card--assistant {
+        border-left: 3px solid var(--success);
+      }
+      </style>
     """

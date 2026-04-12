@@ -45,6 +45,6 @@ def test_chat_service_uses_databao_runtime() -> None:
 
     assert fake_runtime.ask_calls
     assert result.last_databao_result is not None
-    assert result.last_databao_result["used_databao"] is True
+    assert result.last_databao_result.used_databao is True
     assert state.turns[-1].metadata["used_databao"] is True
     assert len(fake_runtime.ask_calls[0]) == 2

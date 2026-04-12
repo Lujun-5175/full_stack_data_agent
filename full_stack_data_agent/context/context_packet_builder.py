@@ -11,6 +11,7 @@ from databao_context_engine import init_or_get_dce_domain
 from databao_context_engine.project.layout import get_source_dir
 from databao_context_engine.search_context.search_service import ContextSearchMode
 
+from full_stack_data_agent.config.provider_resolution import provider_resolution_summary
 from full_stack_data_agent.config.settings import Settings
 from full_stack_data_agent.context.conversation_engine import ConversationEngine
 from full_stack_data_agent.context.models import (
@@ -64,6 +65,7 @@ class ContextPacketBuilder:
         domain_manager = init_or_get_dce_domain(self._settings.domain_dir)
         files_dir = get_source_dir(self._settings.domain_dir) / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
+        provider_summary = provider_resolution_summary(self._settings)
 
         overview_path = files_dir / "full_stack_data_agent_overview.md"
         if not overview_path.exists():
@@ -73,7 +75,7 @@ class ContextPacketBuilder:
                         "# Full Stack Data Agent",
                         "",
                         "This project combines Databao Agent and Databao Context Engine in one local app.",
-                        f"It uses provider ollama and model {self._settings.ollama_model}.",
+                        f"It uses provider {provider_summary['provider']} and model {provider_summary['model']}.",
                         "When answering, prefer conversation memory first, then project domain context.",
                         "The UI should surface provider health, context packet details, and agent debug traces.",
                     ]
@@ -88,8 +90,8 @@ class ContextPacketBuilder:
                     [
                         "# Workspace Notes",
                         "",
-                        "Ollama base URL defaults to http://127.0.0.1:11434.",
-                        f"Ollama model defaults to {self._settings.ollama_model}.",
+                        f"Active provider base URL defaults to {provider_summary['base_url']}.",
+                        f"Active model defaults to {provider_summary['model']}.",
                         "The system should support multi-turn memory such as remembering a provided user name.",
                     ]
                 ),

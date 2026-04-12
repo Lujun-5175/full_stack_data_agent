@@ -62,7 +62,7 @@ def test_default_path_returns_databao_structured_result() -> None:
 
     assert result.last_error is None
     assert result.last_databao_result is not None
-    assert result.last_databao_result["used_databao"] is True
-    assert result.last_databao_result["plot_code"] == '{"mark":"line"}'
+    assert result.last_databao_result.used_databao is True
+    assert result.last_databao_result.plot_code == '{"mark":"line"}'
     assert state.turns[-1].metadata["row_count"] == 3
     assert state.turns[-1].metadata["dataframe_preview"]

@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import TextIO
+from typing import TYPE_CHECKING
 
 from typing_extensions import deprecated
 
@@ -8,14 +9,10 @@ from databao.agent.configs.agent import DEFAULT_AGENT_CONFIG, AgentConfig
 from databao.agent.configs.llm import LLMConfig, LLMConfigDirectory
 from databao.agent.core import Agent, Cache, Executor, Visualizer
 from databao.agent.core.domain import Domain, _DCEProjectDomain, _InMemoryDomain
-from databao.agent.executors import (
-    ClaudeCodeExecutor,
-    DbtProjectExecutor,
-    LighthouseExecutor,
-    ReactDuckDBExecutor,
-)
-from databao.agent.executors.dbt.config import DbtConfig
 from databao.agent.visualizers.vega_chat import VegaChatVisualizer
+
+if TYPE_CHECKING:
+    from databao.agent.executors.dbt.config import DbtConfig
 
 
 def agent(
@@ -34,7 +31,7 @@ def agent(
     auto_output_modality: bool = True,
     writer: TextIO | None = None,
     executor_type: str = "lighthouse",
-    dbt_config: DbtConfig | None = None,
+    dbt_config: object | None = None,
 ) -> Agent:
     """This is an entry point for users to create a new agent.
     Agent can't be modified after it's created. Only new data sources can be added.
@@ -45,14 +42,23 @@ def agent(
     if data_executor is None:
         match executor_type:
             case "lighthouse":
+                from databao.agent.executors.lighthouse.executor import LighthouseExecutor
+
                 data_executor = LighthouseExecutor(writer=writer)
             case "dbt":
+                from databao.agent.executors.dbt.config import DbtConfig
+                from databao.agent.executors.dbt.executor import DbtProjectExecutor
+
                 if dbt_config is None:
                     dbt_config = DbtConfig()
                 data_executor = DbtProjectExecutor(dbt_config=dbt_config, writer=writer)
             case "react_duckdb":
+                from databao.agent.executors.react_duckdb.executor import ReactDuckDBExecutor
+
                 data_executor = ReactDuckDBExecutor(writer=writer)
             case "claude":
+                from databao.agent.executors.claude_code.executor import ClaudeCodeExecutor
+
                 data_executor = ClaudeCodeExecutor(writer=writer)
             case _:
                 raise ValueError(f"Invalid executor type: {executor_type}")

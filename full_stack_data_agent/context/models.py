@@ -34,6 +34,7 @@ class UploadedFileContext:
     table_name: str | None = None
     row_count: int | None = None
     columns: list[str] = field(default_factory=list)
+    semantic_profile: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

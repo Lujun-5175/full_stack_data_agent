@@ -23,19 +23,37 @@ from databao.agent.executors.history_cleaning import clean_tool_history
 logger = logging.getLogger(__name__)
 
 
+_EXPLICIT_VISUALIZATION_MARKERS = (
+    "plot",
+    "chart",
+    "graph",
+    "visual",
+    "visualize",
+    "visualization",
+    "histogram",
+    "scatter",
+    "bar chart",
+    "line chart",
+    "heatmap",
+    "box plot",
+    "distribution",
+    "画图",
+    "绘图",
+    "图表",
+    "分布图",
+    "直方图",
+    "散点图",
+    "热力图",
+    "柱状图",
+    "折线图",
+    "箱线图",
+)
+
+
 class DuckDBExecutor(Executor, ABC):
-    """
-    Base class for executors that execute with a DuckDB connection and LLM configuration.
-    Provides common functionality for message handling and OPA processing.
-    """
+    """Base class for executors that run against DuckDB."""
 
     def __init__(self, writer: TextIO | None = None) -> None:
-        """Initialize agent with graph caching infrastructure.
-
-        Args:
-            writer: Optional TextIO for streaming output. If provided, streaming
-                    output will be written to this writer instead of stdout.
-        """
         self._writer = writer
         self._duckdb_connection: duckdb.DuckDBPyConnection = duckdb.connect(":memory:")
         self._registered_dbs: dict[str, DBDataSource] = {}
@@ -43,13 +61,6 @@ class DuckDBExecutor(Executor, ABC):
         self._registered_dbts: dict[str, DBTDataSource] = {}
 
     def _init_sources_from_domain(self, domain: Domain, *, register_in_duckdb: bool = True) -> None:
-        """Sync sources from the domain into the executor's registered dictionaries.
-
-        When ``register_in_duckdb`` is True (the default), database and dataframe
-        sources are also registered in the shared ``_duckdb_connection``.  Pass
-        ``False`` when the subclass manages its own DuckDB connections (e.g.
-        ``DbtProjectExecutor``).
-        """
         if not isinstance(domain, _Domain):
             return
 
@@ -77,18 +88,9 @@ class DuckDBExecutor(Executor, ABC):
 
 
 class GraphExecutor(DuckDBExecutor, ABC):
-    """
-    Base class for LangGraph executors that execute with a DuckDB connection and LLM configuration.
-    Provides common functionality for graph caching, message handling, and OPA processing.
-    """
+    """Base class for LangGraph executors that share common graph execution helpers."""
 
     def __init__(self, writer: TextIO | None = None) -> None:
-        """Initialize agent with graph caching infrastructure.
-
-        Args:
-            writer: Optional TextIO for streaming output. If provided, streaming
-                    output will be written to this writer instead of stdout.
-        """
         super().__init__(writer)
         self._extra_tools: dict[str, BaseTool] = {}
         self._graph_recursion_limit = 50
@@ -97,13 +99,11 @@ class GraphExecutor(DuckDBExecutor, ABC):
         self._compiled_at_version: int = -1
 
     def register_tools(self, tools: list[BaseTool]) -> None:
-        """Register additional LangChain tools and invalidate the cached compiled graph."""
         for t in tools:
             self._extra_tools[t.name] = t
         self._compiled_tools_version += 1
 
     def drop_last_opa_group(self, cache: Cache, n: int = 1) -> None:
-        """Drop last n groups of operations from the message history."""
         messages = cache.get("state", default={}).get("messages", [])
         human_messages = [m for m in messages if isinstance(m, HumanMessage)]
         if len(human_messages) < n:
@@ -122,12 +122,11 @@ class GraphExecutor(DuckDBExecutor, ABC):
         domain: Domain,
         extra_tools: list[BaseTool] | None,
     ) -> CompiledStateGraph[Any]:
-        """Build and return a fresh compiled graph. Called by _get_compiled_graph when needed."""
+        """Build and return a fresh compiled graph."""
 
     def _get_compiled_graph(
         self, llm_config: LLMConfig, agent_config: AgentConfig, domain: Domain
     ) -> CompiledStateGraph[Any]:
-        """Return a cached compiled graph, recompiling when extra tools have changed."""
         if self._compiled_graph is None or self._compiled_at_version != self._compiled_tools_version:
             extra = list(self._extra_tools.values()) or None
             self._compiled_graph = self._compile_graph(llm_config, agent_config, domain, extra)
@@ -135,12 +134,6 @@ class GraphExecutor(DuckDBExecutor, ABC):
         return self._compiled_graph
 
     def _process_opas(self, opas: list[Opa], cache: Cache) -> list[Any]:
-        """
-        Process a single opa and convert it to a message, appending to message history.
-
-        Returns:
-            All messages including the new one
-        """
         messages: list[Any] = cache.get("state", {}).get("messages", [])
         query = "\n\n".join(opa.query for opa in opas)
         messages.append(HumanMessage(content=query))
@@ -161,31 +154,12 @@ class GraphExecutor(DuckDBExecutor, ABC):
         stream: bool = True,
         writer: TextIO | None = None,
     ) -> tuple[ExecutionResult, Any]:
-        """Shared execution flow for graph-based executors.
-
-        Args:
-            opas: User intents to process.
-            cache: Persistent cache for message history.
-            llm_config: LLM configuration.
-            agent_config: Agent configuration.
-            domain: Domain with data sources.
-            system_prompt: Rendered system prompt text.
-            init_state: Pre-built initial state for the graph (graph-specific).
-            get_result: Callable that extracts an ExecutionResult from the final graph state.
-            extra_preamble: Optional extra messages after system message (e.g. task instruction).
-            stream: Whether to stream output.
-            writer: Optional output writer.
-
-        Returns:
-            Tuple of (ExecutionResult from graph, raw last_state for post-processing).
-        """
         compiled_graph = self._get_compiled_graph(llm_config, agent_config, domain)
         messages: list[Any] = self._process_opas(opas, cache)
 
         all_messages_with_system = self._ensure_system_message(messages, system_prompt, extra_preamble)
         cleaned_messages = clean_tool_history(all_messages_with_system, llm_config.max_tokens_before_cleaning)
 
-        # Patch messages into init_state (all graphs store messages under "messages" key)
         if isinstance(init_state, dict):
             init_state["messages"] = cleaned_messages
         else:
@@ -197,8 +171,6 @@ class GraphExecutor(DuckDBExecutor, ABC):
         )
 
         execution_result = get_result(last_state)
-
-        # Reconcile and persist message history
         all_messages_without_system, all_messages = self._reconcile_messages(
             all_messages_with_system, cleaned_messages, last_state
         )
@@ -207,9 +179,7 @@ class GraphExecutor(DuckDBExecutor, ABC):
                 execution_result.meta[ExecutionResult.META_MESSAGES_KEY] = all_messages
             self._update_message_history(cache, all_messages_without_system)
 
-        # Set modality hints
         execution_result.meta[OutputModalityHints.META_KEY] = self._make_output_modality_hints(execution_result)
-
         return execution_result, last_state
 
     @staticmethod
@@ -218,7 +188,6 @@ class GraphExecutor(DuckDBExecutor, ABC):
         system_content: str,
         extra_preamble: list[BaseMessage] | None = None,
     ) -> list[BaseMessage]:
-        """Prepend a SystemMessage (and optional extra preamble) if not already present."""
         if messages and messages[0].type == "system":
             return messages
         preamble: list[BaseMessage] = [SystemMessage(system_content)]
@@ -232,11 +201,6 @@ class GraphExecutor(DuckDBExecutor, ABC):
         cleaned_messages: list[BaseMessage],
         last_state: dict[str, Any],
     ) -> tuple[list[BaseMessage], list[BaseMessage]]:
-        """Compute the final message list (without system messages) after graph execution.
-
-        Merges new messages produced by the graph with the original conversation,
-        then strips system messages (which are added dynamically per-invocation).
-        """
         final_messages = last_state.get("messages", [])
         if not final_messages:
             return [], []
@@ -246,32 +210,47 @@ class GraphExecutor(DuckDBExecutor, ABC):
         return all_messages_without_system, all_messages
 
     def _update_message_history(self, cache: Cache, final_messages: list[Any]) -> None:
-        """Update message history in cache with final messages from graph execution."""
         if final_messages:
             cache.put("state", {"messages": final_messages})
 
     def _make_output_modality_hints(self, result: ExecutionResult) -> OutputModalityHints:
-        # A separate LLM module could be used to fill out the hints
         vis_prompt = result.meta.get("visualization_prompt", None)
         if vis_prompt is not None and len(vis_prompt) == 0:
             vis_prompt = None
+
         df = result.df
-        should_visualize = vis_prompt is not None and df is not None and len(df) >= 3
+        user_query = self._extract_last_user_query(result)
+        should_visualize = bool(
+            vis_prompt is not None
+            and df is not None
+            and len(df) >= 3
+            and self._has_explicit_visualization_intent(user_query)
+        )
         return OutputModalityHints(visualization_prompt=vis_prompt, should_visualize=should_visualize)
+
+    @staticmethod
+    def _extract_last_user_query(result: ExecutionResult) -> str:
+        messages: list[Any] = result.meta.get(ExecutionResult.META_MESSAGES_KEY, [])
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                return str(message.content)
+        return ""
+
+    @staticmethod
+    def _has_explicit_visualization_intent(user_query: str) -> bool:
+        lowered_query = user_query.lower()
+        return any(keyword in lowered_query for keyword in _EXPLICIT_VISUALIZATION_MARKERS)
 
     @classmethod
     def _executor_tag(cls) -> str:
-        """Derive a short tag from the class name, e.g. 'LighthouseExecutor' → 'lighthouse'."""
         name = cls.__name__
         if name.endswith("Executor"):
             name = name[: -len("Executor")]
-        # CamelCase → kebab-case: "DbtProject" → "dbt-project"
         import re
 
         return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name).lower()
 
     def _build_invoke_config(self, agent_config: AgentConfig, opas: list[Opa]) -> RunnableConfig:
-        """Build a RunnableConfig with automatic executor tagging and user-provided metadata."""
         opa = opas[-1] if opas else None
         executor_tag = self._executor_tag()
 
@@ -301,13 +280,9 @@ class GraphExecutor(DuckDBExecutor, ABC):
         writer: TextIO | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Invoke the graph with the given start state and return the output state."""
         if stream:
-            return GraphExecutor._execute_stream_sync(
-                compiled_graph, start_state, config=config, writer=writer, **kwargs
-            )
-        else:
-            return compiled_graph.invoke(start_state, config=config)
+            return GraphExecutor._execute_stream_sync(compiled_graph, start_state, config=config, writer=writer, **kwargs)
+        return compiled_graph.invoke(start_state, config=config)
 
     @staticmethod
     async def _execute_stream(

@@ -24,6 +24,11 @@ class Settings:
     app_root: Path
     runtime_dir: Path
     domain_dir: Path
+    llm_provider: str
+    llm_fallback_provider: str
+    deepseek_api_key: str
+    deepseek_base_url: str
+    deepseek_model: str
     ollama_base_url: str
     ollama_model: str
     ollama_timeout: float
@@ -31,7 +36,27 @@ class Settings:
     ollama_num_ctx: int
     context_turn_window: int
     context_result_limit: int
-    provider_name: str = "ollama"
+
+    @property
+    def provider_name(self) -> str:
+        return self.llm_provider
+
+    @property
+    def fallback_provider_name(self) -> str:
+        return self.llm_fallback_provider
+
+    @property
+    def active_model(self) -> str:
+        return self.deepseek_model if self.llm_provider == "deepseek" else self.ollama_model
+
+    @property
+    def active_base_url(self) -> str:
+        return self.deepseek_base_url if self.llm_provider == "deepseek" else self.ollama_base_url
+
+    @property
+    def active_api_key(self) -> str | None:
+        key = self.deepseek_api_key.strip()
+        return key or None
 
     @property
     def ollama_tags_url(self) -> str:
@@ -52,6 +77,11 @@ def get_settings() -> Settings:
         app_root=app_root,
         runtime_dir=runtime_dir,
         domain_dir=domain_dir,
+        llm_provider=read("LLM_PROVIDER", "deepseek").strip() or "deepseek",
+        llm_fallback_provider=read("LLM_FALLBACK_PROVIDER", "ollama").strip() or "ollama",
+        deepseek_api_key=read("DEEPSEEK_API_KEY", ""),
+        deepseek_base_url=read("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        deepseek_model=read("DEEPSEEK_MODEL", "deepseek-chat"),
         ollama_base_url=read("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
         ollama_model=read("OLLAMA_MODEL", "gemma4:e4b"),
         ollama_timeout=float(read("OLLAMA_TIMEOUT", "480")),

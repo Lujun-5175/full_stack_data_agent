@@ -15,10 +15,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 UI_URL = "http://127.0.0.1:8501"
 REQUIRED_MODULES = ("streamlit", "pandas", "langchain_core", "langchain", "langgraph")
+AUTO_INSTALL = os.environ.get("FSDA_AUTO_INSTALL", "1").strip().lower() not in {"0", "false", "no"}
 
 
 def _check_modules() -> list[str]:
     return [name for name in REQUIRED_MODULES if importlib.util.find_spec(name) is None]
+
+
+def _install_dependencies() -> bool:
+    print("Installing missing dependencies into the current interpreter...")
+    command = [sys.executable, "-m", "pip", "install", "-e", "."]
+    completed = subprocess.run(command, cwd=str(ROOT))
+    if completed.returncode != 0:
+        return False
+    return True
 
 
 def _wait_for_ui(url: str, timeout_s: int = 60) -> bool:
@@ -41,17 +51,32 @@ def _open_browser_later(url: str) -> None:
 def main() -> int:
     missing_modules = _check_modules()
     if missing_modules:
-        print("FSDA launch preflight failed.")
-        print("Missing Python modules:", ", ".join(missing_modules))
-        print()
-        print("Fix it by installing dependencies into the same interpreter:")
-        print(f'  "{sys.executable}" -m pip install -e .')
-        print()
-        print("Then re-run the launcher.")
-        return 1
+        print("FSDA launch preflight detected missing modules:", ", ".join(missing_modules))
+        if AUTO_INSTALL:
+            print("Auto-install is enabled. Installing now...")
+            if not _install_dependencies():
+                print()
+                print("Dependency installation failed.")
+                print(f'You can retry manually with: "{sys.executable}" -m pip install -e .')
+                return 1
+            missing_modules = _check_modules()
+            if missing_modules:
+                print()
+                print("Dependencies are still missing after installation:", ", ".join(missing_modules))
+                print(f'Please retry manually with: "{sys.executable}" -m pip install -e .')
+                return 1
+        else:
+            print()
+            print("Auto-install is disabled.")
+            print("Fix it by installing dependencies into the same interpreter:")
+            print(f'  "{sys.executable}" -m pip install -e .')
+            print()
+            print("Then re-run the launcher.")
+            return 1
 
     env = os.environ.copy()
-    env.setdefault("STREAMLIT_SERVER_HEADLESS", "false")
+    # Let the launcher open the browser once; prevent Streamlit from opening a second window.
+    env.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
     env.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 
     browser_thread = threading.Thread(target=_open_browser_later, args=(UI_URL,), daemon=True)
@@ -63,6 +88,8 @@ def main() -> int:
         "streamlit",
         "run",
         str(ROOT / "full_stack_data_agent" / "ui" / "app.py"),
+        "--server.headless",
+        "true",
         "--global.developmentMode",
         "false",
     ]

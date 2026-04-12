@@ -18,3 +18,13 @@ def test_process_uploaded_csv_file_marks_tabular() -> None:
     assert result.table_name == "salary"
     assert result.row_count == 2
     assert result.columns == ["borough", "salary"]
+    assert result.semantic_profile["profiling_summary"]["row_count"] == 2
+    assert "salary" in result.semantic_profile["measure_candidates"]
+
+
+def test_process_uploaded_csv_file_keeps_alias_collisions_visible() -> None:
+    result = process_uploaded_file("collision.csv", b"a_b,a b\n1,2\n3,4\n", "text/csv")
+
+    assert result is not None
+    assert result.is_tabular is True
+    assert result.semantic_profile["alias_map"]["a_b"] == ["a_b", "a b"]

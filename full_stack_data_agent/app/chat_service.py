@@ -16,7 +16,7 @@ class ChatServiceResult:
     messages: list[dict[str, Any]]
     provider_status: ProviderHealth
     conversation_snapshot: dict[str, Any]
-    last_databao_result: dict[str, Any] | None
+    last_databao_result: DatabaoTurnResult | None
     last_runtime_snapshot: dict[str, Any] | None
     last_debug_detailed: dict[str, Any] | None
     last_error: str | None
@@ -61,25 +61,46 @@ class ChatService:
                 uploaded_contexts=uploaded_contexts or [],
             )
             metadata = {
-                "provider": self._settings.provider_name,
-                "model": provider_status.model,
+                "provider": last_result.provider_used or provider_status.provider,
+                "model": last_result.model_used or provider_status.model,
+                "provider_used": last_result.provider_used,
+                "model_used": last_result.model_used,
+                "fallback_triggered": last_result.fallback_triggered,
+                "fallback_reason": last_result.fallback_reason,
                 "used_databao": True,
                 "executor_type": runtime_snapshot.executor_type,
                 "row_count": last_result.row_count,
                 "columns": last_result.columns or [],
                 "dataframe_preview": last_result.dataframe_preview,
                 "plot_code": last_result.plot_code,
+                "plot_spec": last_result.plot_spec,
+                "plot_data": last_result.plot_data,
                 "plot_meta": last_result.plot_meta,
+                "plot_error": last_result.plot_error,
+                "chart_debug": last_result.chart_debug,
+                "completion_validation": last_result.completion_validation,
                 "registered_tables": [table.to_dict() for table in runtime_snapshot.registered_tables],
+                "normalization_reports": runtime_snapshot.normalization_reports,
             }
             self._conversation_engine.add_assistant_message(state, last_result.text, metadata=metadata)
             last_debug_detailed = {
+                "provider_status": provider_status.to_dict(),
                 "runtime_snapshot": runtime_snapshot.to_dict(),
                 "thread_meta": last_result.thread_meta,
+                "provider_used": last_result.provider_used,
+                "model_used": last_result.model_used,
+                "fallback_triggered": last_result.fallback_triggered,
+                "fallback_reason": last_result.fallback_reason,
                 "plot_meta": last_result.plot_meta,
+                "plot_spec": last_result.plot_spec,
+                "plot_data": last_result.plot_data,
+                "plot_error": last_result.plot_error,
+                "chart_debug": last_result.chart_debug,
+                "completion_validation": last_result.completion_validation,
                 "used_databao": last_result.used_databao,
                 "thread_reset_reason": runtime_snapshot.thread_reset_reason,
                 "datasource_changed": runtime_snapshot.datasource_changed,
+                "normalization_reports": runtime_snapshot.normalization_reports,
             }
             state.turns[-1].debug_detailed = last_debug_detailed
         except Exception as exc:
@@ -88,7 +109,7 @@ class ChatService:
                 state,
                 f"Request failed: {error}",
                 metadata={
-                    "provider": self._settings.provider_name,
+                    "provider": provider_status.provider,
                     "model": provider_status.model,
                     "used_databao": True,
                     "error": error,
@@ -120,7 +141,7 @@ class ChatService:
             messages=messages,
             provider_status=provider_status,
             conversation_snapshot=state.to_dict(),
-            last_databao_result=last_result.to_dict() if last_result else None,
+            last_databao_result=last_result,
             last_runtime_snapshot=runtime_snapshot.to_dict() if runtime_snapshot else None,
             last_debug_detailed=last_debug_detailed,
             last_error=error,
