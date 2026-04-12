@@ -252,7 +252,7 @@ def render_upload_cards(uploaded_contexts: list[UploadedFileContext], *, compact
         return
 
     for item in uploaded_contexts:
-        summary = "text context" if not item.is_tabular else f"{item.row_count or 0} rows ÁE{len(item.columns)} cols"
+        summary = "text context" if not item.is_tabular else f"{item.row_count or 0} rows × {len(item.columns)} cols"
         if not item.is_tabular:
             summary = item.summary[:160]
         st.markdown(
@@ -619,35 +619,4 @@ def render_uploaded_files_panel(uploaded_contexts: list[UploadedFileContext], re
         if profile or normalization_report:
             with st.expander(f"Column profile: {item.file_name}", expanded=False):
                 _render_profile_summary(profile or {}, normalization_report if isinstance(normalization_report, dict) else {})
-
-
-def render_upload_cards(uploaded_contexts: list[UploadedFileContext], *, compact: bool = False) -> None:
-    if not uploaded_contexts:
-        st.markdown(
-            """
-            <div class="empty-state empty-state--compact">
-              <div class="empty-state__title">No uploaded files</div>
-              <div class="empty-state__body">Upload text, markdown, CSV, JSON, or code files to ground the workspace.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    for item in uploaded_contexts:
-        summary = "text context" if not item.is_tabular else f"{item.row_count or 0} rows x {len(item.columns)} cols"
-        if not item.is_tabular:
-            summary = item.summary[:160]
-        st.markdown(
-            f"""
-            <div class="file-card {'file-card--compact' if compact else ''}">
-              <div class="file-card__top">
-                <div class="file-card__name">{escape(item.file_name)}</div>
-                <div class="file-card__status">{'table' if item.is_tabular else 'text'}</div>
-              </div>
-              <div class="file-card__summary">{escape(summary)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
