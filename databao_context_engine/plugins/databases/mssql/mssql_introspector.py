@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+from typing import ClassVar
+
+from typing_extensions import override
+
+from databao_context_engine.plugins.databases.base_introspector import BaseIntrospector, SQLQuery
+from databao_context_engine.plugins.databases.databases_types import DatabaseSchema
+from databao_context_engine.plugins.databases.introspection_model_builder import IntrospectionModelBuilder
+from databao_context_engine.plugins.databases.mssql.config_file import MSSQLConfigFile
+
+
+class MSSQLIntrospector(BaseIntrospector[MSSQLConfigFile]):
+    _IGNORED_SCHEMAS = {
+        "sys",
+        "information_schema",
+        "db_accessadmin",
+        "db_backupoperator",
+        "db_datareader",
+        "db_datawriter",
+        "db_ddladmin",
+        "db_denydatareader",
+        "db_denydatawriter",
+        "db_owner",
+        "db_securityadmin",
+    }
+    _IGNORED_CATALOGS = (
+        "master",
+        "model",
+        "msdb",
+        "tempdb",
+    )
+    supports_catalogs = True
+    _USE_BATCH: ClassVar[bool] = False
+
+    def _get_catalogs(self, connection, file_config: MSSQLConfigFile) -> list[str]:
+        database = file_config.connection.database
+        if isinstance(database, str) and database:
+            return [database]
+
+        rows = self._connector.execute(connection, "SELECT name FROM sys.databases", None)
+        all_catalogs = [row["name"] for row in rows]
+        return [catalog for catalog in all_catalogs if catalog not in self._IGNORED_CATALOGS]
+
+    def _sql_list_schemas(self, catalogs: list[str] | None) -> SQLQuery:
+        if not catalogs:
+            return SQLQuery("SELECT schema_name, catalog_name FROM information_schema.schemata", None)
+
+        parts = []
+        for catalog in catalogs:
+            parts.append(f"SELECT schema_name, catalog_name FROM {catalog}.information_schema.schemata")
+        return SQLQuery(" UNION ALL ".join(parts), None)
+
+    @override
+    def collect_catalog_model(self, connection, catalog: str, schemas: list[str]) -> list[DatabaseSchema] | None:
+        if self._USE_BATCH:
+            return self.collect_catalog_model_batched(connection, catalog, schemas)
+        return super().collect_catalog_model(connection, catalog, schemas)
+
+    def collect_catalog_model_batched(
+        self, connection, catalog: str, schemas: list[str]
+    ) -> list[DatabaseSchema] | None:
+        if not schemas:
+            return []
+
+        introspection_queries = self._get_catalog_introspection_queries_for_batched_mode(catalog, schemas)
+        sql_queries = {name: query for name, query in introspection_queries.items() if query is not None}
+
+        batch_prefix = "SET NOCOUNT ON; SET XACT_ABORT ON;"
+        batch = batch_prefix + "\n" + ";\n".join(query.sql.strip().rstrip(";") for query in sql_queries.values()) + ";"
+
+        results: dict[str, list[dict]] = {name: [] for name in introspection_queries}
+        with connection.cursor() as cur:
+            cur.execute(batch)
+            for ix, name in enumerate(sql_queries.keys(), start=1):
+                rows: list[dict] = []
+                if cur.description:
+                    cols = [c[0].lower() for c in cur.description]
+                    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+                results[name] = rows
+
+                if ix < len(sql_queries):
+                    ok = cur.nextset()
+                    if not ok:
+                        raise RuntimeError(f"Batch ended early after component #{ix} '{name}'")
+
+        return IntrospectionModelBuilder.build_schemas_from_components(
+            schemas=schemas,
+            rels=results.get("relations", []),
+            cols=results.get("table_columns", []) + results.get("view_columns", []),
+            pk_cols=results.get("pk", []),
+            uq_cols=results.get("uq", []),
+            checks=results.get("checks", []),
+            fk_cols=results.get("fks", []),
+            idx_cols=results.get("idx", []),
+            partitions=results.get("partitions", []),
+        )
+
+    def _get_catalog_introspection_queries_for_batched_mode(
+        self, catalog: str, schemas: list[str]
+    ) -> dict[str, SQLQuery | None]:
+        return {
+            "relations": self.get_relations_sql_query(catalog, schemas),
+            "table_columns": self.get_table_columns_sql_query(catalog, schemas),
+            "pk": self.get_primary_keys_sql_query(catalog, schemas),
+            "uq": self.get_unique_constraints_sql_query(catalog, schemas),
+            "checks": self.get_checks_sql_query(catalog, schemas),
+            "fks": self.get_foreign_keys_sql_query(catalog, schemas),
+            "idx": self.get_indexes_sql_query(catalog, schemas),
+            "partitions": self.get_partitions_sql_query(catalog, schemas),
+            # view_columns should stay at the end, in case it breaks, so that everything before is still executed
+            "view_columns": self.get_view_columns_sql_query(catalog, schemas),
+        }
+
+    @override
+    def get_relations_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                'table' AS kind,
+                CAST(ep.value AS nvarchar(4000)) AS description
+            FROM 
+                sys.tables t
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                LEFT JOIN sys.extended_properties ep 
+                          ON ep.major_id = t.object_id AND ep.minor_id = 0 AND ep.class = 1 AND ep.name = 'MS_Description'
+            WHERE 
+                s.name IN ({schemas_in})
+            UNION ALL
+            SELECT
+                s.name AS schema_name,
+                v.name AS table_name,
+                'view' AS kind,
+                CAST(ep.value AS nvarchar(4000)) AS description
+            FROM 
+                sys.views v
+                JOIN sys.schemas s ON s.schema_id = v.schema_id
+                LEFT JOIN sys.extended_properties ep 
+                          ON ep.major_id = v.object_id AND ep.minor_id = 0 AND ep.class = 1 AND ep.name = 'MS_Description'
+            WHERE 
+                s.name IN ({schemas_in})
+            UNION ALL
+            SELECT
+                s.name AS schema_name,
+                et.name AS table_name,
+                'external_table' AS kind,
+                CAST(ep.value AS nvarchar(4000)) AS description
+            FROM 
+                sys.external_tables et
+                JOIN sys.schemas s ON s.schema_id = et.schema_id
+                LEFT JOIN sys.extended_properties ep 
+                          ON ep.major_id = et.object_id AND ep.minor_id = 0 AND ep.class = 1 AND ep.name = 'MS_Description'
+            WHERE 
+                s.name IN ({schemas_in})
+            ORDER BY 
+                table_name;
+        """,
+            None,
+        )
+
+    @override
+    def get_table_columns_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return self._columns_sql_query(schemas, "o.type = 'U'")
+
+    @override
+    def get_view_columns_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return self._columns_sql_query(schemas, "o.type = 'V'")
+
+    def _columns_sql_query(self, schemas: list[str], object_type_filter: str) -> SQLQuery:
+        # TODO: simplify case when for datatype
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                o.name AS table_name,
+                c.name AS column_name,
+                c.column_id AS ordinal_position,
+                CASE
+                    WHEN t.name IN ('varchar','char','varbinary','binary') THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CAST(c.max_length AS varchar(10)) END + ')'
+                    WHEN t.name IN ('nvarchar','nchar') THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CAST(c.max_length / 2 AS varchar(10)) END + ')'
+                    WHEN t.name IN ('decimal','numeric') THEN t.name + '(' + CAST(c.precision AS varchar(10)) + ',' + CAST(c.scale AS varchar(10)) + ')'
+                    ELSE t.name
+                END AS data_type,
+                CAST(c.is_nullable AS bit) AS is_nullable,
+                CASE
+                    WHEN cc.object_id IS NOT NULL THEN CAST(cc.definition AS nvarchar(4000))
+                    ELSE CAST(dc.definition AS nvarchar(4000))
+                END AS default_expression,
+                CASE
+                    WHEN c.is_identity = 1 THEN 'identity'
+                    WHEN c.is_computed = 1 THEN 'computed'
+                END AS generated,
+                CAST(ep.value AS nvarchar(4000)) AS description
+            FROM 
+                sys.columns c
+                JOIN sys.objects o ON o.object_id = c.object_id AND {object_type_filter}
+                JOIN sys.schemas s ON s.schema_id = o.schema_id
+                JOIN sys.types t ON t.user_type_id = c.user_type_id
+                LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id    
+                LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
+                LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.major_id = c.object_id AND ep.minor_id = c.column_id AND ep.name = 'MS_Description'
+            WHERE 
+                s.name IN ({schemas_in})
+            ORDER BY 
+                o.name, 
+                c.column_id;
+            """,
+            None,
+        )
+
+    @override
+    def get_primary_keys_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                kc.name AS constraint_name,
+                c.name AS column_name,
+                ic.key_ordinal AS position
+            FROM 
+                sys.key_constraints kc
+                JOIN sys.tables t ON t.object_id = kc.parent_object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id AND ic.is_included_column = 0
+                JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE 
+                s.name IN ({schemas_in})
+                AND kc.type = 'PK'
+            ORDER BY 
+                t.name, 
+                kc.name, 
+                ic.key_ordinal;
+        """,
+            None,
+        )
+
+    @override
+    def get_unique_constraints_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                kc.name AS constraint_name,
+                c.name AS column_name,
+                ic.key_ordinal AS position
+            FROM 
+                sys.key_constraints kc
+                JOIN sys.tables t ON t.object_id = kc.parent_object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id AND ic.is_included_column = 0
+                JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE 
+                s.name IN ({schemas_in})
+                AND kc.type = 'UQ'
+            ORDER BY 
+                t.name, 
+                kc.name, 
+                ic.key_ordinal;
+        """,
+            None,
+        )
+
+    @override
+    def get_checks_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                cc.name AS constraint_name,
+                CAST(cc.definition AS nvarchar(4000)) AS expression,
+                CAST(CASE 
+                         WHEN cc.is_not_trusted = 0 THEN 1 
+                         ELSE 0 
+                    END AS bit) AS validated
+            FROM 
+                sys.check_constraints cc
+                JOIN sys.tables t ON t.object_id = cc.parent_object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+            WHERE 
+                s.name IN ({schemas_in})
+            ORDER BY 
+                t.name, 
+                cc.name;
+        """,
+            None,
+        )
+
+    @override
+    def get_foreign_keys_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                fk.name AS constraint_name,
+                fkc.constraint_column_id AS position,
+                pc.name AS from_column,
+                rs.name AS ref_schema,
+                rt.name AS ref_table,
+                rc.name AS to_column,
+                CAST(CASE WHEN fk.is_disabled = 0 THEN 1 ELSE 0 END AS bit) AS enforced,
+                CAST(CASE WHEN fk.is_not_trusted = 0 THEN 1 ELSE 0 END AS bit) AS validated,
+                LOWER(fk.update_referential_action_desc) AS on_update,
+                LOWER(fk.delete_referential_action_desc) AS on_delete
+            FROM 
+                sys.foreign_keys fk
+                JOIN sys.tables t   ON t.object_id = fk.parent_object_id
+                JOIN sys.schemas s  ON s.schema_id = t.schema_id
+                JOIN sys.tables rt  ON rt.object_id = fk.referenced_object_id
+                JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+                JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+                JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id    AND pc.column_id = fkc.parent_column_id
+                JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+            WHERE 
+                s.name IN ({schemas_in})
+            ORDER BY 
+                t.name, 
+                fk.name, 
+                fkc.constraint_column_id;
+        """,
+            None,
+        )
+
+    @override
+    def get_indexes_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        schemas_in = ", ".join(f"({self._quote_literal(s)})" for s in schemas)
+        return SQLQuery(
+            rf"""
+            SELECT
+                s.name AS schema_name,
+                t.name AS table_name,
+                i.name AS index_name,
+                ic.key_ordinal AS position,
+                CAST(
+                    CASE 
+                        WHEN ic.is_descending_key = 1 THEN c.name + ' DESC'
+                        ELSE c.name
+                    END AS nvarchar(4000)
+                ) AS expr,
+                CAST(i.is_unique AS bit) AS is_unique,
+                LOWER(i.type_desc) AS method,
+                CAST(i.filter_definition AS nvarchar(4000)) AS predicate
+            FROM 
+                sys.indexes i
+                JOIN sys.tables t   ON t.object_id = i.object_id
+                JOIN sys.schemas s  ON s.schema_id = t.schema_id
+                JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                JOIN sys.columns c   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE 
+                s.name IN ({schemas_in})
+                AND i.is_primary_key = 0
+                AND i.is_unique_constraint = 0
+                AND ic.is_included_column = 0
+                AND ic.key_ordinal > 0
+            ORDER BY 
+                t.name, 
+                i.name, 
+                ic.key_ordinal;
+        """,
+            None,
+        )
+
+    def _quote_literal(self, value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _sql_sample_rows(self, catalog: str, schema: str, table: str, limit: int) -> SQLQuery:
+        sql = f'SELECT TOP ({limit}) * FROM "{catalog}"."{schema}"."{table}"'
+        return SQLQuery(sql, [limit])

@@ -1,0 +1,43 @@
+from duckdb import DuckDBPyConnection
+
+from databao_context_engine.llm.embeddings.provider import EmbeddingProvider
+from databao_context_engine.services.chunk_embedding_service import ChunkEmbeddingService
+from databao_context_engine.services.embedding_shard_resolver import EmbeddingShardResolver
+from databao_context_engine.services.persistence_service import PersistenceService
+from databao_context_engine.services.table_name_policy import TableNamePolicy
+from databao_context_engine.storage.repositories.factories import (
+    create_chunk_repository,
+    create_datasource_context_hash_repository,
+    create_embedding_repository,
+    create_registry_repository,
+)
+
+
+def create_shard_resolver(conn: DuckDBPyConnection, policy: TableNamePolicy | None = None) -> EmbeddingShardResolver:
+    return EmbeddingShardResolver(
+        conn=conn, registry_repo=create_registry_repository(conn), table_name_policy=policy or TableNamePolicy()
+    )
+
+
+def create_persistence_service(conn: DuckDBPyConnection, *, model_dim: int) -> PersistenceService:
+    return PersistenceService(
+        conn=conn,
+        datasource_context_hash_repo=create_datasource_context_hash_repository(conn),
+        chunk_repo=create_chunk_repository(conn),
+        embedding_repo=create_embedding_repository(conn),
+        dim=model_dim,
+    )
+
+
+def create_chunk_embedding_service(
+    conn: DuckDBPyConnection,
+    *,
+    embedding_provider: EmbeddingProvider,
+) -> ChunkEmbeddingService:
+    resolver = create_shard_resolver(conn)
+    persistence = create_persistence_service(conn, model_dim=embedding_provider.embedding_model_details.model_dim)
+    return ChunkEmbeddingService(
+        persistence_service=persistence,
+        embedding_provider=embedding_provider,
+        shard_resolver=resolver,
+    )

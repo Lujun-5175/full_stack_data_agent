@@ -1,0 +1,167 @@
+import hashlib
+import importlib.util
+import logging
+import re
+from dataclasses import dataclass
+from importlib.resources import files
+from pathlib import Path
+from types import ModuleType
+from typing import Callable, LiteralString
+
+import duckdb
+
+logger = logging.getLogger(__name__)
+
+
+def migrate(db_path: str | Path, migration_files: list[Path] | None = None) -> None:
+    if migration_files is None:
+        migration_files = [
+            migration
+            for migration in files("databao_context_engine.storage.migrations").iterdir()
+            if isinstance(migration, Path) and ".sql" == migration.suffix
+        ]
+
+    db = Path(db_path).expanduser().resolve()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    logger.debug("Running migrations on database: %s", db)
+
+    migration_manager = _MigrationManager(db, migration_files)
+    migration_manager.migrate()
+    logger.debug("Migration complete")
+
+
+@dataclass(frozen=True)
+class MigrationDTO:
+    name: str
+    version: int
+    checksum: str
+
+
+class MigrationError(Exception):
+    """Base class for migration errors."""
+
+
+def load_migrations(conn) -> list[MigrationDTO]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT name, version, checksum, applied_at FROM migration_history",
+        )
+        rows = cur.fetchall()
+        return [
+            MigrationDTO(name=name, version=version, checksum=checksum)
+            for (name, version, checksum, applied_at) in rows
+        ]
+
+
+def _extract_version_from_name(name: str) -> int:
+    version_groups = re.findall(r"(\d+)__", name)
+    if not version_groups:
+        raise ValueError(f"Invalid migration name: {name}")
+    return int(version_groups[0])
+
+
+@dataclass(frozen=True)
+class _Migration:
+    name: str
+    version: int
+    checksum: str
+    query: str
+    before_hook: Callable[[duckdb.DuckDBPyConnection], None] | None
+    after_hook: Callable[[duckdb.DuckDBPyConnection], None] | None
+
+
+def _create_migration(file: Path) -> _Migration:
+    query_bytes = file.read_bytes()
+    query = query_bytes.decode("utf-8")
+    version = _extract_version_from_name(file.name)
+    hook_file = file.with_suffix(".py")
+
+    # We only add whether the Python file exists or not in the checksum, to prevent issues that could happen in the future
+    # due to Python refactoring
+    hook_bytes = bytes(hook_file.exists())
+    checksum = hashlib.md5(query_bytes + hook_bytes, usedforsecurity=False).hexdigest()
+
+    before_hook = None
+    after_hook = None
+    if hook_file.exists():
+        hook_module = _load_hook_module(hook_file)
+        before_hook = getattr(hook_module, "before_migration", None)
+        after_hook = getattr(hook_module, "after_migration", None)
+
+    return _Migration(
+        name=file.name,
+        version=version,
+        checksum=checksum,
+        query=query,
+        before_hook=before_hook,
+        after_hook=after_hook,
+    )
+
+
+def _load_hook_module(file: Path) -> ModuleType:
+    module_name = f"databao_context_engine.storage.migrations._{file.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, file)
+    if spec is None or spec.loader is None:
+        raise MigrationError(f"Failed to load migration hook from {file.name}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _MigrationManager:
+    _init_migration_table_sql: LiteralString = """
+        CREATE SEQUENCE IF NOT EXISTS migration_history_id_seq START 1;
+        
+        CREATE TABLE IF NOT EXISTS migration_history (
+            id              BIGINT PRIMARY KEY DEFAULT nextval('migration_history_id_seq'),
+            name            TEXT NOT NULL,
+            version         INTEGER NOT NULL,
+            checksum        TEXT NOT NULL,
+            applied_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (version)
+        );
+    """
+
+    _insert_migration_sql: LiteralString = "INSERT INTO migration_history (name, version, checksum) VALUES (?, ?, ?)"
+
+    def __init__(self, db_path: Path, migration_files: list[Path]):
+        self._db_path = db_path
+        migrations = [_create_migration(file) for file in migration_files]
+        migrations.sort(key=lambda m: m.version)
+        self._requested_migrations = migrations
+
+    def migrate(self) -> None:
+        applied_migrations: list[MigrationDTO] = self.init_db_and_load_applied_migrations()
+        logger.debug("Applied migrations: %s", applied_migrations)
+        applied_checksums = [m.checksum for m in applied_migrations]
+        applied_versions = [m.version for m in applied_migrations]
+        migrations_to_apply = [m for m in self._requested_migrations if m.checksum not in applied_checksums]
+        logger.debug("Migrations to apply: %s", ", ".join([f"{m.version}: {m.name}" for m in migrations_to_apply]))
+        duplicated_versions = [
+            migration.version for migration in migrations_to_apply if migration.version in applied_versions
+        ]
+        if any(duplicated_versions):
+            raise MigrationError(f"Migrations with versions {duplicated_versions} already exist")
+        with duckdb.connect(self._db_path) as conn:
+            for migration in migrations_to_apply:
+                logger.debug("Applying migration %s", migration.name)
+                with conn.cursor() as cur:
+                    cur.execute("START TRANSACTION;")
+                    try:
+                        if migration.before_hook is not None:
+                            migration.before_hook(cur)
+                        cur.execute(migration.query)
+                        if migration.after_hook is not None:
+                            migration.after_hook(cur)
+                        cur.execute(self._insert_migration_sql, [migration.name, migration.version, migration.checksum])
+                        cur.commit()
+                    except Exception:
+                        cur.rollback()
+                        raise MigrationError(f"Failed to apply migration {migration.name}. Aborting migration process.")
+
+    def init_db_and_load_applied_migrations(self) -> list[MigrationDTO]:
+        with duckdb.connect(str(self._db_path)) as conn:
+            conn.execute(self._init_migration_table_sql)
+            conn.commit()
+            return load_migrations(conn)

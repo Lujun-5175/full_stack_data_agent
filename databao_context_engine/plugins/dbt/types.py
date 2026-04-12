@@ -1,0 +1,139 @@
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field
+
+from databao_context_engine.pluginlib.build_plugin import AbstractConfigFile
+from databao_context_engine.pluginlib.config import ConfigPropertyAnnotation
+from databao_context_engine.plugins.dbt.context_filtering import DbtContextFilter
+
+
+class DbtConfigFile(BaseModel, AbstractConfigFile):
+    name: str
+    type: str = Field(default="dbt")
+    dbt_target_folder_path: Path
+    context_filter: Annotated[DbtContextFilter | None, ConfigPropertyAnnotation(ignored_for_config_wizard=True)] = (
+        Field(
+            default=None,
+            description="Optional include/exclude selector for dbt resources using glob unique_id patterns.",
+        )
+    )
+
+
+class DbtMaterialization(str, Enum):
+    TABLE = "table"
+    VIEW = "view"
+    INCREMENTAL = "incremental"
+    EPHEMERAL = "ephemeral"
+    MATERIALIZED_VIEW = "materialized_view"
+
+    def __str__(self):
+        return self.value
+
+
+@dataclass(kw_only=True)
+class DbtSimpleConstraint:
+    type: Literal["unique", "not_null"]
+    is_enforced: bool
+    description: str | None = None
+
+
+@dataclass(kw_only=True)
+class DbtAcceptedValuesConstraint:
+    type: Literal["accepted_values"]
+    is_enforced: bool
+    description: str | None = None
+    accepted_values: list[str]
+
+
+@dataclass(kw_only=True)
+class DbtRelationshipConstraint:
+    type: Literal["relationships"]
+    is_enforced: bool
+    description: str | None = None
+    target_model: str
+    target_column: str
+
+
+DbtConstraint = DbtSimpleConstraint | DbtAcceptedValuesConstraint | DbtRelationshipConstraint
+
+
+@dataclass(kw_only=True)
+class DbtColumn:
+    name: str
+    type: str | None = None
+    description: str | None = None
+    constraints: list[DbtConstraint] | None = None
+
+
+@dataclass(kw_only=True)
+class DbtModel:
+    id: str
+    name: str
+    database: str
+    schema: str
+    columns: list[DbtColumn]
+    description: str | None = None
+    materialization: DbtMaterialization | None = None
+    primary_key: list[str] | None = None
+    depends_on_nodes: list[str]
+
+
+@dataclass(kw_only=True)
+class DbtSemanticEntity:
+    name: str
+    type: Literal["foreign", "natural", "primary", "unique"]
+    description: str | None = None
+
+
+@dataclass(kw_only=True)
+class DbtSemanticMeasure:
+    name: str
+    agg: Literal["sum", "min", "max", "count_distinct", "sum_boolean", "average", "percentile", "median", "count"]
+    description: str | None = None
+
+
+@dataclass(kw_only=True)
+class DbtSemanticDimension:
+    name: str
+    type: Literal["time", "categorical"]
+    description: str | None = None
+
+
+@dataclass(kw_only=True)
+class DbtSemanticModel:
+    id: str
+    name: str
+    model: str | None = None
+    description: str | None = None
+    entities: list[DbtSemanticEntity]
+    measures: list[DbtSemanticMeasure]
+    dimensions: list[DbtSemanticDimension]
+
+
+@dataclass(kw_only=True)
+class DbtMetric:
+    id: str
+    name: str
+    description: str
+    type: Literal["simple", "ratio", "cumulative", "derived", "conversion"]
+    label: str
+    depends_on_nodes: list[str]
+
+    @property
+    def depends_on_semantic_model(self) -> str | None:
+        return next((node for node in self.depends_on_nodes if node.startswith("semantic_model.")), None)
+
+
+@dataclass(kw_only=True)
+class DbtSemanticLayer:
+    semantic_models: list[DbtSemanticModel]
+    metrics: list[DbtMetric]
+
+
+@dataclass(kw_only=True)
+class DbtContext:
+    models: list[DbtModel]
+    semantic_layer: DbtSemanticLayer

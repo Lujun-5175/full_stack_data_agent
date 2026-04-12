@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import logging
+
+from typing_extensions import override
+
+from databao_context_engine.plugins.databases.base_introspector import BaseIntrospector, SQLQuery
+from databao_context_engine.plugins.databases.databases_types import (
+    CatalogScope,
+    ColumnStats,
+    ColumnStatsEntry,
+    TableStats,
+    TableStatsEntry,
+)
+from databao_context_engine.plugins.databases.duckdb.config_file import DuckDBConfigFile
+
+logger = logging.getLogger(__name__)
+
+
+class DuckDBIntrospector(BaseIntrospector[DuckDBConfigFile]):
+    _IGNORED_CATALOGS = {"system", "temp"}
+    _IGNORED_SCHEMAS = {"information_schema", "pg_catalog"}
+    supports_catalogs = True
+
+    def _get_catalogs(self, connection, file_config: DuckDBConfigFile) -> list[str]:
+        rows = self._connector.execute(connection, "SELECT database_name FROM duckdb_databases();", None)
+        catalogs = [r["database_name"] for r in rows if r.get("database_name")]
+        catalogs_filtered = [c for c in catalogs if c.lower() not in self._IGNORED_CATALOGS]
+        return catalogs_filtered or [self._resolve_pseudo_catalog_name(file_config)]
+
+    def _sql_list_schemas(self, catalogs: list[str] | None) -> SQLQuery:
+        if not catalogs:
+            return SQLQuery("SELECT schema_name, catalog_name FROM information_schema.schemata", None)
+        sql = "SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = ANY(?)"
+        return SQLQuery(sql, (catalogs,))
+
+    @override
+    def get_relations_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            SELECT
+                table_schema AS schema_name,
+                table_name,
+                CASE table_type
+                    WHEN 'BASE TABLE' THEN 'table'
+                    WHEN 'VIEW' THEN 'view'
+                    WHEN 'MATERIALIZED VIEW' THEN 'materialized_view'
+                    ELSE lower(table_type)
+                END AS kind,
+                NULL::VARCHAR AS description
+            FROM 
+                information_schema.tables
+            WHERE 
+                table_schema = ANY(?)
+            ORDER BY 
+                table_name; 
+        """,
+            (schemas,),
+        )
+
+    @override
+    def get_table_columns_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return self._columns_sql_query(schemas, "t.table_type = 'BASE TABLE'")
+
+    @override
+    def get_view_columns_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return self._columns_sql_query(schemas, "t.table_type <> 'BASE TABLE'")
+
+    def _columns_sql_query(self, schemas: list[str], table_type_filter: str) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            SELECT
+                c.table_schema AS schema_name,
+                c.table_name,
+                c.column_name,
+                c.ordinal_position AS ordinal_position,
+                c.data_type AS data_type,
+                CASE 
+                    WHEN c.is_nullable = 'YES' THEN TRUE 
+                    ELSE FALSE 
+                END AS is_nullable,
+                c.column_default AS default_expression,
+                NULL::VARCHAR AS generated,
+                NULL::VARCHAR AS description
+            FROM 
+                information_schema.columns c
+                JOIN information_schema.tables t
+                    ON t.table_schema = c.table_schema
+                    AND t.table_name = c.table_name
+            WHERE 
+                c.table_schema = ANY(?)
+                AND """
+            + table_type_filter
+            + r"""
+            ORDER BY 
+                c.table_schema,
+                c.table_name, 
+                c.ordinal_position; 
+        """,
+            (schemas,),
+        )
+
+    @override
+    def get_primary_keys_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            WITH d AS (
+                SELECT 
+                    *
+                FROM 
+                    duckdb_constraints()
+                WHERE 
+                    schema_name = ANY(?)
+                    AND constraint_type = 'PRIMARY KEY'
+            ),
+            cols AS (
+                SELECT
+                    d.schema_name,
+                    d.table_name,
+                    d.constraint_name,
+                    r.pos AS position,
+                    d.constraint_column_names[r.pos] AS column_name
+                FROM 
+                    d,
+                    range(1, length(d.constraint_column_names) + 1) AS r(pos)
+            )
+            SELECT
+                schema_name,
+                table_name,
+                constraint_name,
+                position,
+                column_name
+            FROM 
+                cols
+            ORDER BY
+                schema_name,
+                table_name, 
+                constraint_name, 
+                position;
+        """,
+            (schemas,),
+        )
+
+    @override
+    def get_unique_constraints_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            WITH d AS (
+                SELECT 
+                    *
+                FROM 
+                    duckdb_constraints()
+                WHERE 
+                    schema_name = ANY(?)
+                    AND constraint_type = 'UNIQUE'
+            ),
+            cols AS (
+                SELECT
+                    d.schema_name,
+                    d.table_name,
+                    d.constraint_name,
+                    r.pos AS position,
+                    d.constraint_column_names[r.pos] AS column_name
+                FROM 
+                    d,
+                    range(1, length(d.constraint_column_names) + 1) AS r(pos)
+            )
+            SELECT
+                schema_name,
+                table_name,
+                constraint_name,
+                position,
+                column_name
+            FROM 
+                cols
+            ORDER BY
+                schema_name,
+                table_name, 
+                constraint_name, 
+                position;
+        """,
+            (schemas,),
+        )
+
+    @override
+    def get_checks_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            SELECT
+                d.schema_name,
+                d.table_name,
+                d.constraint_name,
+                d.expression        AS expression,
+                TRUE                AS validated
+            FROM 
+                duckdb_constraints() AS d
+            WHERE 
+                d.schema_name = ANY(?)
+                AND d.constraint_type = 'CHECK'
+            ORDER BY 
+                d.schema_name, 
+                d.table_name, 
+                d.constraint_name; 
+           """,
+            (schemas,),
+        )
+
+    @override
+    def get_foreign_keys_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            WITH d AS (
+                SELECT 
+                    *
+                FROM 
+                    duckdb_constraints()
+                WHERE 
+                    schema_name = ANY(?)
+                    AND constraint_type = 'FOREIGN KEY'
+            ),
+            cols AS (
+                SELECT
+                    d.schema_name,
+                    d.table_name,
+                    d.constraint_name,
+                    r.pos AS position,
+                    d.constraint_column_names[r.pos]  AS from_column,
+                    d.referenced_column_names[r.pos]  AS to_column
+                FROM 
+                    d,
+                    range(1, length(d.constraint_column_names) + 1) AS r(pos)
+            ),
+            ref AS (
+            SELECT
+                rc.constraint_schema AS schema_name,
+                rc.constraint_name,
+                tc.table_schema AS ref_schema,
+                tc.table_name   AS ref_table
+            FROM 
+                information_schema.referential_constraints rc
+                JOIN information_schema.table_constraints tc ON 
+                    tc.constraint_schema = rc.unique_constraint_schema 
+                    AND tc.constraint_name = rc.unique_constraint_name
+            ),
+            rules AS (
+                SELECT
+                    constraint_schema AS schema_name,
+                    constraint_name,
+                    lower(update_rule) AS on_update,
+                    lower(delete_rule) AS on_delete
+                FROM 
+                    information_schema.referential_constraints
+            )
+            SELECT
+                c.schema_name,
+                c.table_name,
+                c.constraint_name,
+                c.position,
+                c.from_column,
+                r.ref_schema,
+                r.ref_table,
+                c.to_column,
+                coalesce(u.on_update, 'no action') AS on_update,
+                coalesce(u.on_delete, 'no action') AS on_delete,
+                TRUE AS enforced,
+                TRUE AS validated
+            FROM 
+                cols c JOIN ref r ON r.schema_name = c.schema_name AND r.constraint_name = c.constraint_name
+            LEFT JOIN rules u ON u.schema_name = c.schema_name AND u.constraint_name = c.constraint_name
+            ORDER BY 
+                c.schema_name, 
+                c.table_name, 
+                c.constraint_name, 
+                c.position;
+        """,
+            (schemas,),
+        )
+
+    @override
+    def get_indexes_sql_query(self, catalog: str, schemas: list[str]) -> SQLQuery:
+        return SQLQuery(
+            r"""
+            WITH idx AS (
+                SELECT
+                    schema_name,
+                    table_name,
+                    index_name,
+                    is_unique,
+                    string_split(trim(BOTH '[]' FROM expressions), ',') AS expr_list
+                FROM 
+                    duckdb_indexes()
+                WHERE 
+                    schema_name = ANY(?)
+            )
+            SELECT
+                schema_name,
+                table_name,
+                index_name,
+                pos AS position,
+                trim(expr_list[pos]) AS expr,
+                is_unique
+            FROM 
+                idx,
+                range(1, length(expr_list) + 1) AS r(pos)
+            ORDER BY
+                schema_name, 
+                table_name,
+                index_name,
+                position;
+         """,
+            (schemas,),
+        )
+
+    @override
+    def collect_stats(
+        self,
+        connection,
+        catalog: str,
+        scope: CatalogScope,
+    ) -> tuple[list[TableStatsEntry], list[ColumnStatsEntry]]:
+        table_stats: list[TableStatsEntry] = []
+        column_stats: list[ColumnStatsEntry] = []
+
+        for schema_scope in scope.schemas:
+            for table_ref in schema_scope.tables:
+                if table_ref.kind.value != "table":
+                    continue
+
+                schema_name = schema_scope.schema_name
+                table_name = table_ref.table_name
+
+                try:
+                    summary_query = f'SUMMARIZE "{schema_name}"."{table_name}"'
+                    summary_rows = self._connector.execute(connection, summary_query, None)
+
+                    if not summary_rows:
+                        continue
+
+                    row_count = summary_rows[0].get("count")
+                    table_stats.append(
+                        TableStatsEntry(
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            stats=TableStats(row_count=row_count, approximate=True),
+                        )
+                    )
+
+                    for row in summary_rows:
+                        column_name = row.get("column_name")
+                        if not column_name:
+                            continue
+
+                        null_percentage = row.get("null_percentage")
+                        null_count = None
+                        non_null_count = None
+                        if null_percentage is not None and row_count is not None:
+                            null_frac = float(null_percentage) / 100.0
+                            null_count = round(row_count * null_frac)
+                            non_null_count = row_count - null_count
+
+                        # currently min/max values are strings, so we might need to convert them to the appropriate type
+                        # also, duckdb doesn't provide most_common_vals/most_common_freqs
+                        # but there are avg, std, q25 etc. available, we can use them as well
+                        approx_distinct_count = row.get("approx_unique")
+                        cardinality_kind, distinct_count = self._compute_cardinality_stats(approx_distinct_count)
+
+                        column_stats.append(
+                            ColumnStatsEntry(
+                                schema_name=schema_name,
+                                table_name=table_name,
+                                column_name=column_name,
+                                stats=ColumnStats(
+                                    null_count=null_count,
+                                    non_null_count=non_null_count,
+                                    distinct_count=distinct_count,
+                                    cardinality_kind=cardinality_kind,
+                                    min_value=row.get("min"),
+                                    max_value=row.get("max"),
+                                    total_row_count=row_count,
+                                ),
+                            )
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to collect stats for {schema_name}.{table_name}: {e}")
+                    continue
+
+        return table_stats, column_stats
+
+    def _sql_sample_rows(self, catalog: str, schema: str, table: str, limit: int) -> SQLQuery:
+        sql = f'SELECT * FROM "{schema}"."{table}" LIMIT ?'
+        return SQLQuery(sql, (limit,))
+
+    def _quote_literal(self, value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"

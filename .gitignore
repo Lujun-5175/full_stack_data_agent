@@ -1,0 +1,7 @@
+.vendor/
+.runtime/
+.tmp/
+.pytest_cache/
+full_stack_data_agent.egg-info/
+__pycache__/
+*.pyc

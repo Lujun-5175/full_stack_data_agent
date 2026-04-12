@@ -1,0 +1,44 @@
+[project]
+name = "full-stack-data-agent"
+version = "0.1.0"
+description = "Unified local Databao Agent + Context Engine + Ollama + Streamlit app."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2.2",
+    "pydantic>=2.8.0,<3",
+    "requests>=2.32.0",
+    "python-dotenv>=1.0.1",
+    "streamlit>=1.54.0",
+    "langgraph>=0.6.8",
+    "langchain>=1.1.3",
+    "langchain-openai>=1.1.3",
+    "langchain-anthropic>=1.3.0",
+    "langchain-ollama>=1.0.0",
+    "duckdb>=1.4.3",
+    "jinja2>=3.1.6",
+    "sqlparse>=0.5.5",
+    "tabulate>=0.9.0",
+    "psycopg2-binary>=2.9.10",
+    "matplotlib>=3.10.0",
+    "edaplot-vl~=0.1.4",
+    "diskcache>=5.6.3",
+    "sqlalchemy>=2.0.45",
+    "snowflake-sqlalchemy>=1.8.2",
+    "sqlalchemy-bigquery>=1.11.0",
+    "mcp>=1.23.3",
+    "watchdog>=6.0.0",
+    "pyyaml>=6.0.3",
+    "pyarrow>=19.0.1",
+    "xxhash>=3.6.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["databao*", "databao_context_engine*", "full_stack_data_agent*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"

@@ -1,0 +1,140 @@
+import shutil
+from enum import Enum
+from pathlib import Path
+
+from databao_context_engine.project.layout import (
+    get_config_file,
+    get_deprecated_config_file,
+    get_examples_dir,
+    get_gitignore_file,
+    get_logs_dir,
+    get_output_dir,
+    get_source_dir,
+)
+from databao_context_engine.project.project_config import ProjectConfig
+
+
+class InitErrorReason(Enum):
+    """Reasons for which domain initialization can fail."""
+
+    PROJECT_DIR_DOESNT_EXIST = "PROJECT_DIR_DOESNT_EXIST"
+    PROJECT_DIR_NOT_DIRECTORY = "PROJECT_DIR_NOT_DIRECTORY"
+    PROJECT_DIR_ALREADY_INITIALIZED = "PROJECT_DIR_ALREADY_INITIALIZED"
+
+
+class InitDomainError(Exception):
+    """Raised when a domain can't be initialized.
+
+    Attributes:
+        message: The error message.
+        reason: The reason for the initialization failure.
+    """
+
+    reason: InitErrorReason
+
+    def __init__(self, reason: InitErrorReason, message: str | None):
+        """Initialize the InitDomainError.
+
+        Args:
+            reason: The reason why the initialization failed.
+            message: An optional error message.
+        """
+        super().__init__(message or "")
+
+        self.reason = reason
+
+
+def init_project_dir(
+    project_dir: Path, ollama_model_id: str | None = None, ollama_model_dim: int | None = None
+) -> Path:
+    project_creator = _ProjectCreator(
+        project_dir=project_dir, ollama_model_id=ollama_model_id, ollama_model_dim=ollama_model_dim
+    )
+    project_creator.create()
+
+    return project_dir
+
+
+class _ProjectCreator:
+    def __init__(self, project_dir: Path, ollama_model_id: str | None = None, ollama_model_dim: int | None = None):
+        self.project_dir = project_dir
+        self.deprecated_config_file = get_deprecated_config_file(project_dir)
+        self.config_file = get_config_file(project_dir)
+        self.src_dir = get_source_dir(project_dir)
+        self.examples_dir = get_examples_dir(project_dir)
+        self.logs_dir = get_logs_dir(project_dir)
+        self.gitignore_file = get_gitignore_file(project_dir)
+        self.ollama_model_id = ollama_model_id
+        self.ollama_model_dim = ollama_model_dim
+
+    def create(self):
+        self.ensure_can_init_project()
+
+        self.create_default_src_dir()
+        self.create_logs_dir()
+        self.create_examples_dir()
+        self.create_dce_config_file()
+        self.create_gitignore_file()
+
+    def ensure_can_init_project(self) -> bool:
+        if not self.project_dir.exists():
+            raise InitDomainError(
+                message=f"{self.project_dir.resolve()} does not exist", reason=InitErrorReason.PROJECT_DIR_DOESNT_EXIST
+            )
+
+        if not self.project_dir.is_dir():
+            raise InitDomainError(
+                message=f"{self.project_dir.resolve()} is not a directory",
+                reason=InitErrorReason.PROJECT_DIR_NOT_DIRECTORY,
+            )
+
+        if self.config_file.is_file() or self.deprecated_config_file.is_file():
+            raise InitDomainError(
+                message=f"Can't initialize a Databao Context Engine project in a folder that already contains a config file. [project_dir: {self.project_dir.resolve()}]",
+                reason=InitErrorReason.PROJECT_DIR_ALREADY_INITIALIZED,
+            )
+
+        if self.src_dir.is_dir():
+            raise InitDomainError(
+                message=f"Can't initialize a Databao Context Engine project in a folder that already contains a src directory. [project_dir: {self.project_dir.resolve()}]",
+                reason=InitErrorReason.PROJECT_DIR_ALREADY_INITIALIZED,
+            )
+
+        if self.examples_dir.is_file():
+            raise InitDomainError(
+                message=f"Can't initialize a Databao Context Engine project in a folder that already contains an examples dir. [project_dir: {self.project_dir.resolve()}]",
+                reason=InitErrorReason.PROJECT_DIR_ALREADY_INITIALIZED,
+            )
+
+        return True
+
+    def create_default_src_dir(self) -> None:
+        self.src_dir.mkdir(parents=False, exist_ok=False)
+
+        self.src_dir.joinpath("files").mkdir(parents=False, exist_ok=False)
+
+    def create_logs_dir(self) -> None:
+        self.logs_dir.mkdir(exist_ok=True)
+
+    def create_examples_dir(self) -> None:
+        examples_to_copy = Path(__file__).parent.joinpath("resources").joinpath("examples")
+
+        shutil.copytree(str(examples_to_copy), str(self.examples_dir))
+
+    def create_dce_config_file(self) -> None:
+        self.config_file.touch()
+        ProjectConfig.save_config_file(
+            self.config_file, ollama_model_id=self.ollama_model_id, ollama_model_dim=self.ollama_model_dim
+        )
+
+    def create_gitignore_file(self) -> None:
+        db_path = get_output_dir(self.project_dir).joinpath("dce.duckdb")
+        logs_path = get_logs_dir(self.project_dir)
+        examples_path = get_examples_dir(self.project_dir)
+
+        entries = [
+            db_path.relative_to(self.project_dir).as_posix(),
+            f"{logs_path.relative_to(self.project_dir).as_posix()}/",
+            f"{examples_path.relative_to(self.project_dir).as_posix()}/",
+        ]
+        self.gitignore_file.write_text("\n".join(entries))
