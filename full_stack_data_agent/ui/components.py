@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime
 from html import escape
@@ -9,6 +10,8 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import streamlit as st
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 from full_stack_data_agent.context.models import ConversationState, ConversationTurn, UploadedFileContext
 from full_stack_data_agent.llm.models import ProviderHealth
@@ -24,6 +27,33 @@ def _fallback_provider_label(status: Any) -> str:
 
 def _safe_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+def _is_matplotlib_figure(obj: Any) -> bool:
+    return isinstance(obj, Figure)
+
+
+def _is_matplotlib_axes(obj: Any) -> bool:
+    return isinstance(obj, Axes)
+
+
+def _render_plot_image_base64(plot_image_base64: str | None, *, mime_type: str | None = None) -> bool:
+    if not plot_image_base64:
+        return False
+    try:
+        raw = base64.b64decode(plot_image_base64)
+    except Exception:
+        return False
+    st.image(raw, use_container_width=True)
+    return True
+
+
+def _as_matplotlib_figure(obj: Any) -> Figure | Axes | None:
+    if _is_matplotlib_figure(obj):
+        return obj
+    if _is_matplotlib_axes(obj):
+        return obj.figure
+    return None
 
 
 def _fmt_time(timestamp: float | None) -> str:
@@ -115,6 +145,13 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
 
             plot = getattr(plot_object, "plot", None)
             if plot is not None:
+                matplotlib_plot = _as_matplotlib_figure(plot)
+                if matplotlib_plot is not None:
+                    chart_debug["chart_renderable"] = True
+                    chart_debug["chart_renderer"] = "pyplot"
+                    chart_debug["chart_type"] = type(plot).__name__
+                    st.pyplot(matplotlib_plot, use_container_width=True)
+                    return True
                 chart_debug["chart_renderable"] = True
                 chart_debug["chart_renderer"] = "altair_chart"
                 chart_debug["chart_type"] = type(plot).__name__
@@ -125,6 +162,14 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
             chart_debug["chart_failure_reason"] = str(exc)
             st.error(f"Chart render failed: {exc}")
             return False
+
+        matplotlib_plot = _as_matplotlib_figure(plot_object)
+        if matplotlib_plot is not None:
+            chart_debug["chart_renderable"] = True
+            chart_debug["chart_renderer"] = "pyplot"
+            chart_debug["chart_type"] = type(plot_object).__name__
+            st.pyplot(matplotlib_plot, use_container_width=True)
+            return True
 
         png_bytes = getattr(plot_object, "png_bytes", None)
         if callable(png_bytes):
@@ -153,6 +198,14 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
                 pass
 
     response_dict = _response_payload_dict(response)
+    plot_image_base64 = response_dict.get("plot_image_base64")
+    if plot_image_base64:
+        chart_debug["chart_renderable"] = True
+        chart_debug["chart_renderer"] = "image_base64"
+        chart_debug["chart_type"] = response_dict.get("plot_kind") or response_dict.get("plot_backend") or "image"
+        if _render_plot_image_base64(str(plot_image_base64), mime_type=response_dict.get("plot_image_mime_type")):
+            return True
+
     plot_spec = response_dict.get("plot_spec")
     plot_data = response_dict.get("plot_data")
     if not plot_spec or not plot_data:
@@ -589,7 +642,18 @@ def render_result_panel(result: Any | None) -> None:
         chart_debug["chart_failure_stage"] = failure_stage
         chart_debug["chart_failure_reason"] = failure_reason
         st.warning(f"Chart render issue ({failure_stage}): {failure_reason}")
-    if response_dict.get("plot_code"):
+    plot_backend = response_dict.get("plot_backend") or chart_debug.get("plot_backend")
+    plot_kind = response_dict.get("plot_kind") or chart_debug.get("plot_kind")
+    if plot_backend == "seaborn":
+        with st.expander("Latest plot artifact", expanded=False):
+            if response_dict.get("plot_image_base64"):
+                st.caption(f"backend={plot_backend} | kind={plot_kind or '--'}")
+                _render_plot_image_base64(str(response_dict["plot_image_base64"]), mime_type=response_dict.get("plot_image_mime_type"))
+            if response_dict.get("plot_code"):
+                st.code(str(response_dict["plot_code"]), language="json")
+            elif response_dict.get("plot_meta"):
+                st.code(_safe_json(response_dict["plot_meta"]), language="json")
+    elif response_dict.get("plot_code"):
         with st.expander("Latest plot spec", expanded=False):
             st.code(str(response_dict["plot_code"]), language="json")
     elif response_dict.get("plot_spec") and not chart_rendered:

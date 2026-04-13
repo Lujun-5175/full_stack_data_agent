@@ -18,7 +18,7 @@ class SmokeRuntime:
             available_models=["gemma4:e4b"],
         )
 
-    def ask(self, conversation_id: str, query: str, *, uploaded_contexts):
+    def ask(self, conversation_id: str, query: str, *, uploaded_contexts, prior_turns=None):
         self.calls.append(
             {
                 "conversation_id": conversation_id,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import re
 import time
@@ -397,6 +399,7 @@ class DatabaoRuntime:
 
     def _create_agent(self, domain: Any, llm_config: "LLMConfig") -> Any:
         from databao.agent import api as bao_api
+        from databao.agent.visualizers.seaborn_chat import SeabornChatVisualizer
 
         return bao_api.agent(
             domain,
@@ -406,6 +409,7 @@ class DatabaoRuntime:
             stream_ask=False,
             stream_plot=False,
             auto_output_modality=True,
+            visualizer=SeabornChatVisualizer(llm_config),
         )
 
     def _resolve_provider_config(self, provider_name: str | None = None) -> ResolvedProviderConfig:
@@ -445,25 +449,32 @@ class DatabaoRuntime:
         plot_spec = getattr(plot_result, "spec", None) if plot_result is not None else None
         plot_data_frame = getattr(plot_result, "spec_df", None) if plot_result is not None else None
         plot_data = plot_data_frame.to_dict(orient="records") if plot_data_frame is not None else None
+        plot_meta = getattr(plot_result, "meta", None) if plot_result is not None else None
+        plot_backend = self._plot_backend(plot_result)
+        plot_kind = self._plot_kind(plot_result, plot_spec, plot_meta)
+        plot_image_base64, plot_image_mime_type = self._plot_image_artifact(plot_result)
         plot_data_rows = len(plot_data) if plot_data is not None else 0
         chart_renderable = bool(
             plot_result is not None
-            and (getattr(plot_result, "plot", None) is not None or (plot_spec is not None and plot_data_frame is not None))
+            and (
+                getattr(plot_result, "plot", None) is not None
+                or (plot_spec is not None and plot_data_frame is not None)
+                or plot_image_base64 is not None
+            )
         )
         chart_generated = plot_result is not None and plot_error is None
 
         session_provider = getattr(session, "provider_name", None) or self._settings.llm_provider
         resolved = self._resolve_provider_config(session_provider)
-        chart_renderer = None
-        chart_type = None
+        chart_renderer = plot_backend
+        chart_type = plot_kind
         if plot_result is not None:
             plot_object = getattr(plot_result, "plot", None)
             if plot_object is not None:
                 chart_renderer = type(plot_object).__name__
-                chart_type = type(plot_object).__name__
             elif plot_spec is not None:
-                chart_renderer = "vega_lite_spec"
-                chart_type = str((plot_spec or {}).get("mark") or "vega-lite")
+                chart_renderer = chart_renderer or "vega_lite_spec"
+                chart_type = chart_type or str((plot_spec or {}).get("mark") or "vega-lite")
 
         chart_artifact_id = self._build_chart_artifact_id(
             query=query,
@@ -472,6 +483,9 @@ class DatabaoRuntime:
             plot_code=getattr(plot_result, "code", None) if plot_result is not None else None,
             plot_spec=plot_spec,
             plot_data=plot_data,
+            plot_backend=plot_backend,
+            plot_kind=plot_kind,
+            plot_image_base64=plot_image_base64,
             plot_error=plot_error,
         )
         chart_failure_stage = None
@@ -495,6 +509,9 @@ class DatabaoRuntime:
             "chart_renderable": chart_renderable,
             "chart_renderer": chart_renderer,
             "chart_type": chart_type,
+            "plot_backend": plot_backend,
+            "plot_kind": plot_kind,
+            "plot_image_present": plot_image_base64 is not None,
             "chart_artifact_id": chart_artifact_id,
             "plot_spec_present": plot_spec is not None,
             "plot_data_rows": plot_data_rows,
@@ -525,7 +542,11 @@ class DatabaoRuntime:
             plot_object=plot_result,
             plot_spec=plot_spec,
             plot_data=plot_data,
-            plot_meta=getattr(plot_result, "meta", None) if plot_result is not None else None,
+            plot_meta=plot_meta,
+            plot_backend=plot_backend,
+            plot_kind=plot_kind,
+            plot_image_base64=plot_image_base64,
+            plot_image_mime_type=plot_image_mime_type,
             plot_error=plot_error,
             chart_debug=chart_debug,
             completion_validation=completion_validation,
@@ -625,6 +646,9 @@ class DatabaoRuntime:
         plot_code: str | None,
         plot_spec: dict[str, Any] | None,
         plot_data: list[dict[str, Any]] | None,
+        plot_backend: str | None,
+        plot_kind: str | None,
+        plot_image_base64: str | None,
         plot_error: str | None,
     ) -> str:
         payload = {
@@ -634,6 +658,9 @@ class DatabaoRuntime:
             "plot_code": plot_code,
             "plot_spec": plot_spec,
             "plot_data_rows": len(plot_data or []),
+            "plot_backend": plot_backend,
+            "plot_kind": plot_kind,
+            "plot_image_present": plot_image_base64 is not None,
             "plot_error": plot_error,
         }
         digest = hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -759,6 +786,66 @@ class DatabaoRuntime:
     def _auto_visualization_result(thread: Any) -> "VisualisationResult | None":
         auto_vis = getattr(thread, "_visualization_result", None)
         return auto_vis if auto_vis is not None else None
+
+    @staticmethod
+    def _plot_backend(plot_result: Any | None) -> str | None:
+        if plot_result is None:
+            return None
+        backend = getattr(plot_result, "backend", None) or getattr(plot_result, "plot_backend", None)
+        if backend is not None:
+            return str(backend)
+        if hasattr(plot_result, "spec") and hasattr(plot_result, "spec_df"):
+            return "vega"
+        if hasattr(plot_result, "png_bytes") or hasattr(plot_result, "png_base64") or hasattr(plot_result, "image"):
+            return "seaborn"
+        return type(plot_result).__name__
+
+    @staticmethod
+    def _plot_kind(plot_result: Any | None, plot_spec: dict[str, Any] | None, plot_meta: dict[str, Any] | None) -> str | None:
+        if plot_result is None:
+            return None
+        kind = getattr(plot_result, "kind", None) or getattr(plot_result, "plot_kind", None)
+        if kind is not None:
+            return str(kind)
+        if isinstance(plot_meta, dict) and plot_meta.get("kind") is not None:
+            return str(plot_meta["kind"])
+        if isinstance(plot_spec, dict):
+            mark = plot_spec.get("mark")
+            if mark is not None:
+                return str(mark)
+        return None
+
+    @staticmethod
+    def _plot_image_artifact(plot_result: Any | None) -> tuple[str | None, str | None]:
+        if plot_result is None:
+            return None, None
+        png_base64 = getattr(plot_result, "png_base64", None)
+        if callable(png_base64):
+            try:
+                encoded = png_base64()
+                if encoded:
+                    return str(encoded), "image/png"
+            except Exception:
+                pass
+        png_bytes = getattr(plot_result, "png_bytes", None)
+        if callable(png_bytes):
+            try:
+                raw = png_bytes()
+                if raw:
+                    return base64.b64encode(raw).decode("utf-8"), "image/png"
+            except Exception:
+                pass
+        image = getattr(plot_result, "image", None)
+        if callable(image):
+            try:
+                image_obj = image()
+                if image_obj is not None:
+                    buffer = io.BytesIO()
+                    image_obj.save(buffer, format="PNG")
+                    return base64.b64encode(buffer.getvalue()).decode("utf-8"), "image/png"
+            except Exception:
+                pass
+        return None, None
 
     def _maybe_collect_plot(self, thread: Any, query: str) -> tuple["VisualisationResult | None", str | None]:
         if not self._has_explicit_chart_intent(query):
@@ -909,9 +996,9 @@ class DatabaoRuntime:
             registered_tables=session.registered_tables,
             normalization_reports=[table.normalization_report for table in session.registered_tables],
             context_build_error=session.context_build_error,
-            context_replayed=session.context_replayed,
-            datasource_changed=session.datasource_changed,
-            thread_reset_reason=session.thread_reset_reason,
+            context_replayed=getattr(session, "context_replayed", False),
+            datasource_changed=getattr(session, "datasource_changed", False),
+            thread_reset_reason=getattr(session, "thread_reset_reason", None),
         )
 
     def _register_description_once(self, domain: Any, description: str, *, dedupe_key: str | None = None) -> None:

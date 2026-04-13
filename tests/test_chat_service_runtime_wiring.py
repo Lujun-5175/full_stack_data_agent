@@ -17,7 +17,7 @@ class FakeRuntime:
             available_models=["gemma4:e4b"],
         )
 
-    def ask(self, conversation_id: str, query: str, *, uploaded_contexts):
+    def ask(self, conversation_id: str, query: str, *, uploaded_contexts, prior_turns=None):
         self.ask_calls.append((conversation_id, query))
         return (
             DatabaoTurnResult(

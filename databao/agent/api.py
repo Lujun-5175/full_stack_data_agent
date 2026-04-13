@@ -9,7 +9,7 @@ from databao.agent.configs.agent import DEFAULT_AGENT_CONFIG, AgentConfig
 from databao.agent.configs.llm import LLMConfig, LLMConfigDirectory
 from databao.agent.core import Agent, Cache, Executor, Visualizer
 from databao.agent.core.domain import Domain, _DCEProjectDomain, _InMemoryDomain
-from databao.agent.visualizers.vega_chat import VegaChatVisualizer
+from databao.agent.visualizers.seaborn_chat import SeabornChatVisualizer
 
 if TYPE_CHECKING:
     from databao.agent.executors.dbt.config import DbtConfig
@@ -69,7 +69,7 @@ def agent(
         agent_config,
         name=name or "default_agent",
         data_executor=data_executor,
-        visualizer=visualizer or VegaChatVisualizer(llm_config),
+        visualizer=visualizer or SeabornChatVisualizer(llm_config),
         cache=cache or InMemCache(),
         rows_limit=rows_limit,
         stream_ask=stream_ask,

@@ -36,6 +36,10 @@ class DatabaoTurnResult:
     plot_spec: dict[str, Any] | None = None
     plot_data: list[dict[str, Any]] | None = None
     plot_meta: dict[str, Any] | None = None
+    plot_backend: str | None = None
+    plot_kind: str | None = None
+    plot_image_base64: str | None = None
+    plot_image_mime_type: str | None = None
     plot_error: str | None = None
     chart_debug: dict[str, Any] = field(default_factory=dict)
     completion_validation: dict[str, Any] | None = None
@@ -57,6 +61,10 @@ class DatabaoTurnResult:
             "plot_spec": self.plot_spec,
             "plot_data": self.plot_data,
             "plot_meta": self.plot_meta,
+            "plot_backend": self.plot_backend,
+            "plot_kind": self.plot_kind,
+            "plot_image_base64": self.plot_image_base64,
+            "plot_image_mime_type": self.plot_image_mime_type,
             "plot_error": self.plot_error,
             "chart_debug": self.chart_debug,
             "completion_validation": self.completion_validation,
