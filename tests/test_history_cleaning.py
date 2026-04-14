@@ -32,3 +32,15 @@ def test_truncate_block_rejects_missing_dataframe_metadata() -> None:
 
     with pytest.raises(ValueError, match="Could not find dataframe metadata"):
         _truncate_block({}, [ai_message, tool_message])
+
+
+def test_truncate_block_includes_query_id_in_summary() -> None:
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[{"id": "call-submit", "name": "submit_result", "args": {"query_id": "q-1", "result_description": "ok"}}],
+    )
+    tool_message = ToolMessage(content="submitted", tool_call_id="call-submit")
+    summary = _truncate_block({"call-run": {"query_id": "q-1", "sql": "select 1", "df": "a\\n1"}}, [ai_message, tool_message])
+
+    assert "Query ID:" in str(summary.content)
+    assert "q-1" in str(summary.content)

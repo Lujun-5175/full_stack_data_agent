@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import Any, TextIO
 
 import duckdb
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
@@ -48,6 +48,20 @@ _EXPLICIT_VISUALIZATION_MARKERS = (
     "柱状图",
     "折线图",
     "箱线图",
+)
+
+_RESULT_REUSE_MARKERS = (
+    "不要重新筛选",
+    "不要重新聚合",
+    "同一个结果",
+    "同一批",
+    "基于刚才",
+    "same result",
+    "same grouped result",
+    "do not re-filter",
+    "don't re-filter",
+    "do not regroup",
+    "don't regroup",
 )
 
 
@@ -157,12 +171,21 @@ class GraphExecutor(DuckDBExecutor, ABC):
     ) -> tuple[ExecutionResult, Any]:
         compiled_graph = self._get_compiled_graph(llm_config, agent_config, domain)
         messages: list[Any] = self._process_opas(opas, cache)
+        cached_state = cache.get("state", {})
 
         all_messages_with_system = self._ensure_system_message(messages, system_prompt, extra_preamble)
-        cleaned_messages = clean_tool_history(all_messages_with_system, llm_config.max_tokens_before_cleaning)
+        last_user_query = opas[-1].query if opas else ""
+        if self._looks_like_result_reuse_request(last_user_query):
+            cleaned_messages = all_messages_with_system.copy()
+        else:
+            cleaned_messages = clean_tool_history(all_messages_with_system, llm_config.max_tokens_before_cleaning)
 
         if isinstance(init_state, dict):
             init_state["messages"] = cleaned_messages
+            if "query_ids" in init_state:
+                query_ids = dict(cached_state.get("query_ids", {}))
+                query_ids.update(self._collect_query_ids(cleaned_messages))
+                init_state["query_ids"] = query_ids
         else:
             init_state = {**init_state, "messages": cleaned_messages}
 
@@ -182,6 +205,16 @@ class GraphExecutor(DuckDBExecutor, ABC):
 
         execution_result.meta[OutputModalityHints.META_KEY] = self._make_output_modality_hints(execution_result)
         return execution_result, last_state
+
+    @staticmethod
+    def _collect_query_ids(messages: list[BaseMessage]) -> dict[str, ToolMessage]:
+        query_ids: dict[str, ToolMessage] = {}
+        for message in messages:
+            if isinstance(message, ToolMessage) and isinstance(message.artifact, dict) and "query_id" in message.artifact:
+                query_id = str(message.artifact["query_id"])
+                if query_id:
+                    query_ids[query_id] = message
+        return query_ids
 
     @staticmethod
     def _ensure_system_message(
@@ -212,7 +245,7 @@ class GraphExecutor(DuckDBExecutor, ABC):
 
     def _update_message_history(self, cache: Cache, final_messages: list[Any]) -> None:
         if final_messages:
-            cache.put("state", {"messages": final_messages})
+            cache.put("state", {"messages": final_messages, "query_ids": self._collect_query_ids(final_messages)})
 
     def _make_output_modality_hints(self, result: ExecutionResult) -> OutputModalityHints:
         vis_prompt = result.meta.get("visualization_prompt", None)
@@ -241,6 +274,11 @@ class GraphExecutor(DuckDBExecutor, ABC):
     def _has_explicit_visualization_intent(user_query: str) -> bool:
         lowered_query = user_query.lower()
         return any(keyword in lowered_query for keyword in _EXPLICIT_VISUALIZATION_MARKERS)
+
+    @staticmethod
+    def _looks_like_result_reuse_request(user_query: str) -> bool:
+        lowered_query = user_query.lower()
+        return any(marker in lowered_query for marker in _RESULT_REUSE_MARKERS)
 
     @classmethod
     def _executor_tag(cls) -> str:
@@ -294,7 +332,11 @@ class GraphExecutor(DuckDBExecutor, ABC):
         writer: TextIO | None = None,
         **kwargs: Any,
     ) -> Any:
-        frontend = TextStreamFrontend(start_state, writer=writer)
+        frontend = TextStreamFrontend(
+            start_state,
+            writer=writer,
+            on_text_chunk=getattr(writer, "on_text_chunk", None),
+        )
         last_state = None
         async for mode, chunk in compiled_graph.astream(
             start_state,
@@ -319,7 +361,11 @@ class GraphExecutor(DuckDBExecutor, ABC):
         writer: TextIO | None = None,
         **kwargs: Any,
     ) -> Any:
-        frontend = TextStreamFrontend(start_state, writer=writer)
+        frontend = TextStreamFrontend(
+            start_state,
+            writer=writer,
+            on_text_chunk=getattr(writer, "on_text_chunk", None),
+        )
         last_state = None
         for mode, chunk in compiled_graph.stream(
             start_state,

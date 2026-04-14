@@ -40,6 +40,9 @@ This SQL was generated:
 {df["sql"]}
 ```
 
+Query ID:
+{tool_call["args"]["query_id"]}
+
 Here is an answer, which was shown to the user:
 Dataframe:
 {df["df"]}
