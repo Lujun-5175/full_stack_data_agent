@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from types import SimpleNamespace
@@ -13,28 +14,82 @@ import streamlit as st
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
+from databao.agent.visualizers.vega_vis_tool import VegaVisTool
 from full_stack_data_agent.context.models import ConversationState, ConversationTurn, UploadedFileContext
 from full_stack_data_agent.llm.models import ProviderHealth
-from databao.agent.visualizers.vega_vis_tool import VegaVisTool
 
-_PROFILE_VALUE_PREVIEW_LIMIT = 10
 _CHART_MIN_HEIGHT = 360
+_PROFILE_VALUE_PREVIEW_LIMIT = 10
 
 
-def _fallback_provider_label(status: Any) -> str:
-    return str(getattr(status, "fallback_provider", None) or "--")
+@dataclass
+class MessageView:
+    message_id: str
+    turn_id: str
+    role: str
+    content: str
+    timestamp: float | None
+    streaming: bool = False
+    status: str = "complete"
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    trace: dict[str, Any] = field(default_factory=dict)
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
+    charts: list[dict[str, Any]] = field(default_factory=list)
+    tables: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _safe_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, default=str)
 
 
-def _is_matplotlib_figure(obj: Any) -> bool:
-    return isinstance(obj, Figure)
+def _fmt_time(timestamp: float | None) -> str:
+    if not timestamp:
+        return "--:--"
+    return datetime.fromtimestamp(timestamp).strftime("%H:%M")
 
 
-def _is_matplotlib_axes(obj: Any) -> bool:
-    return isinstance(obj, Axes)
+def _fallback_provider_label(status: Any) -> str:
+    return str(getattr(status, "fallback_provider", None) or "--")
+
+
+def _turn_ui_state() -> dict[str, dict[str, Any]]:
+    state = st.session_state.get("turn_ui_state")
+    if not isinstance(state, dict):
+        state = {}
+        st.session_state["turn_ui_state"] = state
+    return state
+
+
+def _ensure_turn_ui_state(state: ConversationState) -> dict[str, dict[str, Any]]:
+    ui_state = _turn_ui_state()
+    total = len(state.turns)
+    for index, turn in enumerate(state.turns):
+        if not isinstance(ui_state.get(turn.turn_id), dict):
+            ui_state[turn.turn_id] = {"expanded": index == total - 1}
+        elif "expanded" not in ui_state[turn.turn_id]:
+            ui_state[turn.turn_id]["expanded"] = index == total - 1
+    return ui_state
+
+
+def _turn_is_expanded(turn: ConversationTurn, index: int, total: int) -> bool:
+    ui_state = _turn_ui_state()
+    entry = ui_state.get(turn.turn_id)
+    if not isinstance(entry, dict):
+        ui_state[turn.turn_id] = {"expanded": index == total - 1}
+        entry = ui_state[turn.turn_id]
+    if "expanded" not in entry:
+        entry["expanded"] = index == total - 1
+    return bool(entry.get("expanded", index == total - 1))
+
+
+def _set_turn_expanded(turn_id: str, expanded: bool) -> None:
+    ui_state = _turn_ui_state()
+    entry = ui_state.get(turn_id)
+    if not isinstance(entry, dict):
+        ui_state[turn_id] = {"expanded": expanded}
+    else:
+        entry["expanded"] = expanded
 
 
 def _render_plot_image_base64(plot_image_base64: str | None, *, mime_type: str | None = None) -> bool:
@@ -48,18 +103,20 @@ def _render_plot_image_base64(plot_image_base64: str | None, *, mime_type: str |
     return True
 
 
+def _is_matplotlib_figure(obj: Any) -> bool:
+    return isinstance(obj, Figure)
+
+
+def _is_matplotlib_axes(obj: Any) -> bool:
+    return isinstance(obj, Axes)
+
+
 def _as_matplotlib_figure(obj: Any) -> Figure | Axes | None:
     if _is_matplotlib_figure(obj):
         return obj
     if _is_matplotlib_axes(obj):
         return obj.figure
     return None
-
-
-def _fmt_time(timestamp: float | None) -> str:
-    if not timestamp:
-        return "--:--"
-    return datetime.fromtimestamp(timestamp).strftime("%H:%M")
 
 
 def _response_payload(result: Any | None) -> Any | None:
@@ -92,6 +149,17 @@ def _chart_debug_from_response(response: Any | None) -> dict[str, Any]:
     return chart_debug if isinstance(chart_debug, dict) else {}
 
 
+def _chart_failed_upstream(chart_debug: dict[str, Any] | None) -> bool:
+    if not isinstance(chart_debug, dict):
+        return False
+    return str(chart_debug.get("planner_status") or "") in {
+        "planning_failed",
+        "schema_parse_failed",
+        "validation_failed",
+        "render_failed",
+    }
+
+
 def _ensure_chart_height(chart: Any, *, minimum_height: int = _CHART_MIN_HEIGHT) -> Any:
     to_dict = getattr(chart, "to_dict", None)
     if callable(to_dict):
@@ -119,6 +187,8 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
 
     chart_debug = chart_debug if isinstance(chart_debug, dict) else {}
     chart_debug["chart_render_called"] = True
+    if _chart_failed_upstream(chart_debug):
+        return False
 
     plot_object = getattr(response, "plot_object", None)
     if plot_object is not None:
@@ -158,7 +228,7 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
                 st.altair_chart(_ensure_chart_height(plot), use_container_width=True)
                 return True
         except Exception as exc:
-            chart_debug["chart_failure_stage"] = "ui_render_or_layout"
+            chart_debug["chart_failure_stage"] = "ui_render_failed"
             chart_debug["chart_failure_reason"] = str(exc)
             st.error(f"Chart render failed: {exc}")
             return False
@@ -184,21 +254,12 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
             except Exception:
                 pass
 
-        image = getattr(plot_object, "image", None)
-        if callable(image):
-            try:
-                image_obj = image()
-                if image_obj is not None:
-                    chart_debug["chart_renderable"] = True
-                    chart_debug["chart_renderer"] = "image"
-                    chart_debug["chart_type"] = type(plot_object).__name__
-                    st.image(image_obj, use_container_width=True)
-                    return True
-            except Exception:
-                pass
-
     response_dict = _response_payload_dict(response)
     plot_image_base64 = response_dict.get("plot_image_base64")
+    if not plot_image_base64:
+        plot_meta = response_dict.get("plot_meta")
+        if isinstance(plot_meta, dict):
+            plot_image_base64 = plot_meta.get("plot_image_base64")
     if plot_image_base64:
         chart_debug["chart_renderable"] = True
         chart_debug["chart_renderer"] = "image_base64"
@@ -225,138 +286,11 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
         st.altair_chart(_ensure_chart_height(chart), use_container_width=True)
         return True
     except Exception as exc:
-        chart_debug["chart_failure_stage"] = "ui_render_or_layout"
+        chart_debug["chart_failure_stage"] = "ui_render_failed"
         chart_debug["chart_failure_reason"] = str(exc)
         chart_debug["plot_spec_dump"] = plot_spec
         st.error(f"Chart render failed: {exc}")
         return False
-
-
-def render_shell_header(status: ProviderHealth, state: ConversationState, uploaded_count: int) -> None:
-    st.markdown(
-        f"""
-        <div class="shell-header">
-          <div>
-            <div class="shell-header__eyebrow">Workspace / Data Agent / Session</div>
-            <div class="shell-header__title-row">
-              <h1>Full Stack Data Agent</h1>
-              <span class="status-dot {'status-dot--ok' if status.connected else 'status-dot--warn'}"></span>
-            </div>
-            <p>Local-first analysis workspace for grounded questions, uploads, results, and traceable execution.</p>
-          </div>
-          <div class="shell-header__badges">
-            <span class="badge {'badge--ok' if status.connected else 'badge--warn'}">{'Connected' if status.connected else 'Disconnected'}</span>
-            <span class="badge">Provider: {escape(status.provider)}</span>
-            <span class="badge">Model: {escape(status.model)}</span>
-            <span class="badge">Fallback: {escape(_fallback_provider_label(status))}</span>
-            <span class="badge">Session: {escape(state.conversation_id[:8])}</span>
-            <span class="badge">Turns: {state.turn_count}</span>
-            <span class="badge">Uploads: {uploaded_count}</span>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_context_rail_header(status: ProviderHealth, state: ConversationState, uploaded_count: int) -> None:
-    st.markdown(
-        f"""
-        <div class="rail-brand">
-          <div class="rail-brand__icon">FS</div>
-          <div>
-            <div class="rail-brand__name">Full Stack Data Agent</div>
-            <div class="rail-brand__meta">{escape(status.provider)} {'connected' if status.connected else 'disconnected'}</div>
-            <div class="rail-brand__detail">{escape(status.model)} | fallback {escape(_fallback_provider_label(status))} | Turn {state.turn_count} | {uploaded_count} files</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_nav_items() -> None:
-    st.markdown(
-        """
-        <div class="panel-title">Navigation</div>
-        <div class="nav-list">
-          <div class="nav-item nav-item--active">Workspace</div>
-          <div class="nav-item">Uploads</div>
-          <div class="nav-item">Results</div>
-          <div class="nav-item">Trace</div>
-          <div class="nav-item">Runtime</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_upload_cards(uploaded_contexts: list[UploadedFileContext], *, compact: bool = False) -> None:
-    if not uploaded_contexts:
-        st.markdown(
-            """
-            <div class="empty-state empty-state--compact">
-              <div class="empty-state__title">No uploaded files</div>
-              <div class="empty-state__body">Upload text, markdown, CSV, JSON, or code files to ground the workspace.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    for item in uploaded_contexts:
-        summary = "text context" if not item.is_tabular else f"{item.row_count or 0} rows × {len(item.columns)} cols"
-        if not item.is_tabular:
-            summary = item.summary[:160]
-        st.markdown(
-            f"""
-            <div class="file-card {'file-card--compact' if compact else ''}">
-              <div class="file-card__top">
-                <div class="file-card__name">{escape(item.file_name)}</div>
-                <div class="file-card__status">{'table' if item.is_tabular else 'text'}</div>
-              </div>
-              <div class="file-card__summary">{escape(summary)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-def _render_profile_summary(profile: dict[str, Any], normalization_report: dict[str, Any] | None = None) -> None:
-    column_hints = profile.get("column_type_hints", {}) if isinstance(profile, dict) else {}
-    grouped_columns: dict[str, list[str]] = {"measure": [], "time": [], "key": [], "categorical": [], "boolean": []}
-    for column, hint in column_hints.items():
-        if not isinstance(hint, dict):
-            continue
-        semantic_type = str(hint.get("semantic_type") or "")
-        if semantic_type in grouped_columns:
-            grouped_columns[semantic_type].append(str(column))
-
-    def _render_group(title: str, columns: list[str]) -> None:
-        if columns:
-            st.markdown(f"**{title}:** {', '.join(columns)}")
-
-    _render_group("Numeric measures", grouped_columns["measure"])
-    _render_group("Time columns", grouped_columns["time"])
-    _render_group("Identifier columns", grouped_columns["key"])
-    _render_group("Categorical columns", grouped_columns["categorical"])
-    _render_group("Boolean columns", grouped_columns["boolean"])
-
-    canonical_maps = profile.get("canonical_categorical_value_maps", {}) if isinstance(profile, dict) else {}
-    if canonical_maps:
-        st.markdown("**Canonicalized variants detected**")
-        for column, mapping in canonical_maps.items():
-            if not isinstance(mapping, dict) or not mapping:
-                continue
-            preview_pairs = [f"{source} -> {target}" for source, target in list(mapping.items())[:3]]
-            st.markdown(f"- {escape(str(column))}: {escape('; '.join(preview_pairs))}")
-
-    if isinstance(normalization_report, dict):
-        warnings = normalization_report.get("warnings") or []
-        if warnings:
-            st.markdown("**Normalization warnings**")
-            for warning in warnings:
-                st.markdown(f"- {escape(str(warning))}")
 
 
 def _registered_table_lookup(result: Any | None) -> dict[str, dict[str, Any]]:
@@ -388,25 +322,67 @@ def _registered_table_lookup(result: Any | None) -> dict[str, dict[str, Any]]:
     return lookup
 
 
-def render_registered_tables_panel(result: Any | None) -> None:
-    st.markdown(
-        """
-        <div class="panel-title">Registered Tables</div>
-        <div class="panel-subtitle">Tabular data normalized and registered for the current session.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    table_lookup = _registered_table_lookup(result)
-    if not table_lookup:
+def _render_profile_summary(profile: dict[str, Any], normalization_report: dict[str, Any] | None = None) -> None:
+    column_hints = profile.get("column_type_hints", {}) if isinstance(profile, dict) else {}
+    grouped_columns: dict[str, list[str]] = {"measure": [], "time": [], "key": [], "categorical": [], "boolean": []}
+    for column, hint in column_hints.items():
+        if not isinstance(hint, dict):
+            continue
+        semantic_type = str(hint.get("semantic_type") or "")
+        if semantic_type in grouped_columns:
+            grouped_columns[semantic_type].append(str(column))
+
+    for title, key in (
+        ("Numeric measures", "measure"),
+        ("Time columns", "time"),
+        ("Identifier columns", "key"),
+        ("Categorical columns", "categorical"),
+        ("Boolean columns", "boolean"),
+    ):
+        if grouped_columns[key]:
+            st.markdown(f"**{title}:** {', '.join(grouped_columns[key])}")
+
+    canonical_maps = profile.get("canonical_categorical_value_maps", {}) if isinstance(profile, dict) else {}
+    if canonical_maps:
+        st.markdown("**Canonicalized variants detected**")
+        for column, mapping in canonical_maps.items():
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            preview_pairs = [f"{source} -> {target}" for source, target in list(mapping.items())[:_PROFILE_VALUE_PREVIEW_LIMIT]]
+            st.markdown(f"- {escape(str(column))}: {escape('; '.join(preview_pairs))}")
+
+    if isinstance(normalization_report, dict):
+        warnings = normalization_report.get("warnings") or []
+        if warnings:
+            st.markdown("**Normalization warnings**")
+            for warning in warnings:
+                st.markdown(f"- {escape(str(warning))}")
+
+
+def render_upload_cards(uploaded_contexts: list[UploadedFileContext], *, compact: bool = False) -> None:
+    if not uploaded_contexts:
+        st.markdown('<div class="empty-card">No uploaded files yet.</div>', unsafe_allow_html=True)
+        return
+
+    for item in uploaded_contexts:
+        summary = "text context" if not item.is_tabular else f"{item.row_count or 0} rows x {len(item.columns)} cols"
+        if not item.is_tabular:
+            summary = item.summary[:160]
         st.markdown(
-            """
-            <div class="empty-state empty-state--compact">
-              <div class="empty-state__title">No data tables</div>
-              <div class="empty-state__body">Upload a CSV file and the registered tables will appear here.</div>
+            f"""
+            <div class="sidebar-item {'sidebar-item--compact' if compact else ''}">
+              <div class="sidebar-item__title">{escape(item.file_name)}</div>
+              <div class="sidebar-item__meta">{escape('table' if item.is_tabular else 'text')} · {escape(summary)}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+
+
+def render_registered_tables_panel(result: Any | None) -> None:
+    table_lookup = _registered_table_lookup(result)
+    if not table_lookup:
+        st.markdown('<div class="empty-card">No registered tables yet.</div>', unsafe_allow_html=True)
         return
 
     seen: set[str] = set()
@@ -419,268 +395,266 @@ def render_registered_tables_panel(result: Any | None) -> None:
         column_preview = ", ".join(columns) if columns else "no columns"
         st.markdown(
             f"""
-            <div class="file-card">
-              <div class="file-card__top">
-                <div class="file-card__name">{escape(name)}</div>
-                <div class="file-card__status">{int(table.get('row_count') or 0)} rows</div>
-              </div>
-              <div class="file-card__summary">{escape(column_preview)}</div>
+            <div class="sidebar-item">
+              <div class="sidebar-item__title">{escape(name)}</div>
+              <div class="sidebar-item__meta">{int(table.get('row_count') or 0)} rows · {escape(column_preview)}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        profile = table.get("semantic_profile") or {}
+        normalization_report = table.get("normalization_report") or {}
+        if profile or normalization_report:
+            with st.expander(f"Schema details · {name}", expanded=False):
+                _render_profile_summary(profile if isinstance(profile, dict) else {}, normalization_report if isinstance(normalization_report, dict) else {})
+
+
 def render_runtime_snapshot(status: ProviderHealth, state: ConversationState, uploaded_count: int) -> None:
+    connected_text = "Connected" if status.connected else "Disconnected"
     st.markdown(
         f"""
-        <div class="stat-stack">
-          <div class="stat-chip">
-            <span class="stat-chip__label">Provider</span>
-            <span class="stat-chip__value">{escape(status.provider)}</span>
-          </div>
-          <div class="stat-chip">
-            <span class="stat-chip__label">Model</span>
-            <span class="stat-chip__value">{escape(status.model)}</span>
-          </div>
-          <div class="stat-chip">
-            <span class="stat-chip__label">Fallback</span>
-            <span class="stat-chip__value">{escape(_fallback_provider_label(status))}</span>
-          </div>
-          <div class="stat-chip">
-            <span class="stat-chip__label">Turns</span>
-            <span class="stat-chip__value">{state.turn_count}</span>
-          </div>
-          <div class="stat-chip">
-            <span class="stat-chip__label">Uploads</span>
-            <span class="stat-chip__value">{uploaded_count}</span>
-          </div>
+        <div class="session-card">
+          <div class="session-card__row"><span>Provider</span><strong>{escape(status.provider)}</strong></div>
+          <div class="session-card__row"><span>Model</span><strong>{escape(status.model)}</strong></div>
+          <div class="session-card__row"><span>Fallback</span><strong>{escape(_fallback_provider_label(status))}</strong></div>
+          <div class="session-card__row"><span>Runtime</span><strong>{connected_text}</strong></div>
+          <div class="session-card__row"><span>Turns</span><strong>{state.turn_count}</strong></div>
+          <div class="session-card__row"><span>Uploads</span><strong>{uploaded_count}</strong></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_workspace_heading() -> None:
-    st.markdown(
-        """
-        <div class="workspace-breadcrumb">Tools / Full Stack Data Agent / Current Session</div>
-        <div class="workspace-heading">
-          <div>
-            <div class="workspace-heading__title">Agent Workspace</div>
-            <div class="workspace-heading__subtitle">
-              Configure a prompt, ground it with uploads, run the local model, and inspect output and trace side by side.
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def _message_tables(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    preview = metadata.get("dataframe_preview") or []
+    if not preview:
+        return []
+    return [
+        {
+            "label": "Table preview",
+            "rows": preview,
+            "row_count": metadata.get("row_count"),
+            "columns": metadata.get("columns") or [],
+        }
+    ]
 
 
-def render_composer_intro() -> None:
-    st.markdown(
-        """
-        <div class="panel-title">Ask The Agent</div>
-        <div class="panel-subtitle">
-          Treat this panel like a task runner for the local data agent, not a plain chat box.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def _message_artifacts(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    for key in ("completion_validation", "normalization_reports", "registered_tables"):
+        value = metadata.get(key)
+        if value:
+            artifacts.append({"label": key.replace("_", " ").title(), "value": value})
+    return artifacts
 
 
-def _render_chart_from_turn(turn: ConversationTurn) -> bool:
-    return _render_chart_from_response(SimpleNamespace(last_databao_result=turn.metadata))
-
-
-def render_conversation_history(state: ConversationState, last_result: Any | None = None) -> None:
-    st.markdown(
-        """
-        <div class="panel-title">Conversation</div>
-        <div class="panel-subtitle">The assistant response, data preview, charts, and trace all live inline.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if not state.turns:
-        st.markdown(
-            """
-            <div class="empty-state conversation-empty">
-              <div class="empty-state__title">No conversation yet</div>
-              <div class="empty-state__body">Run the first prompt to start a grounded analysis thread.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+def build_message_views(state: ConversationState) -> list[MessageView]:
+    views: list[MessageView] = []
+    for turn in state.turns:
+        views.append(
+            MessageView(
+                message_id=turn.user_message.message_id,
+                turn_id=turn.turn_id,
+                role="user",
+                content=turn.user_message.content,
+                timestamp=turn.user_message.created_at,
+                status=turn.user_message.status,
+                metadata={},
+            )
         )
+        if turn.assistant_message is None:
+            continue
+        metadata = turn.metadata if isinstance(turn.metadata, dict) else {}
+        chart_requested = any(
+            [
+                metadata.get("plot_spec"),
+                metadata.get("plot_data"),
+                metadata.get("plot_image_base64"),
+                metadata.get("plot_backend"),
+                metadata.get("plot_object"),
+                metadata.get("chart_debug"),
+            ]
+        )
+        charts = [{"label": "Chart"}] if chart_requested else []
+        views.append(
+            MessageView(
+                message_id=turn.assistant_message.message_id,
+                turn_id=turn.turn_id,
+                role="assistant",
+                content=turn.assistant_message.content,
+                timestamp=turn.assistant_message.created_at,
+                streaming=turn.assistant_message.status == "streaming",
+                status=turn.assistant_message.status,
+                attachments=[],
+                trace=turn.debug_detailed or {},
+                artifacts=_message_artifacts(metadata),
+                charts=charts,
+                tables=_message_tables(metadata),
+                metadata=metadata,
+            )
+        )
+    return views
+
+
+def _render_table_renderer(table: dict[str, Any], *, key_suffix: str) -> None:
+    rows = table.get("rows") or []
+    if not rows:
         return
+    st.markdown(
+        f'<div class="message-subtitle">{escape(str(table.get("label") or "Table"))}</div>',
+        unsafe_allow_html=True,
+    )
+    preview_height = min(340, max(220, 56 + (len(rows) * 28)))
+    st.dataframe(rows, use_container_width=True, hide_index=True, height=preview_height)
 
-    for index, turn in enumerate(state.turns):
-        user_message = turn.user_message
-        assistant_message = turn.assistant_message
-        st.markdown(
-            f"""
-            <div class="history-card history-card--user">
-              <div class="history-card__top">
-                <span class="history-card__role">user</span>
-                <span class="history-card__meta">Turn {index + 1} | {_fmt_time(user_message.created_at)}</span>
-              </div>
-              <div class="history-card__body">{escape(user_message.content)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+
+def _render_chart_renderer(metadata: dict[str, Any], *, key_suffix: str) -> None:
+    chart_debug = _chart_debug_from_response(metadata) or dict(metadata.get("chart_debug") or {})
+    chart_rendered = _render_chart_from_response(SimpleNamespace(last_databao_result=metadata), chart_debug=chart_debug)
+    plot_error = chart_debug.get("plot_error") or metadata.get("plot_error")
+    if _chart_failed_upstream(chart_debug):
+        failure_stage = chart_debug.get("planner_status") or chart_debug.get("chart_failure_stage") or "generation_failed"
+        failure_reason = (
+            chart_debug.get("render_error")
+            or "; ".join(str(item) for item in (chart_debug.get("validation_errors") or []))
+            or chart_debug.get("planner_error")
+            or chart_debug.get("chart_failure_reason")
+            or plot_error
+            or "chart requested but failed upstream"
         )
-        if assistant_message is None:
+        st.error(f"Chart generation failed ({failure_stage}): {failure_reason}")
+    elif plot_error:
+        st.warning(f"Chart generation failed: {plot_error}")
+    elif chart_debug.get("chart_requested") and not chart_rendered:
+        failure_stage = chart_debug.get("chart_failure_stage") or "ui_render_failed"
+        failure_reason = chart_debug.get("chart_failure_reason") or "chart requested but did not render"
+        st.warning(f"Chart render issue ({failure_stage}): {failure_reason}")
+
+
+def _render_artifact_renderer(artifacts: list[dict[str, Any]], *, key_suffix: str) -> None:
+    for artifact in artifacts:
+        with st.expander(str(artifact.get("label") or "Artifact"), expanded=False):
+            st.code(_safe_json(artifact.get("value")), language="json")
+
+
+def _render_trace_panel(trace: dict[str, Any], *, key_suffix: str) -> None:
+    with st.expander("Trace / Details", expanded=False):
+        st.code(_safe_json(trace or {}), language="json")
+
+
+def _render_user_message(message: MessageView) -> None:
+    st.markdown(f'<div class="message-text">{escape(message.content)}</div>', unsafe_allow_html=True)
+
+
+def _render_assistant_message(message: MessageView) -> None:
+    if message.content.strip():
+        st.markdown(message.content)
+    elif message.streaming:
+        st.markdown('<div class="message-streaming">Thinking...</div>', unsafe_allow_html=True)
+
+    for index, table in enumerate(message.tables):
+        _render_table_renderer(table, key_suffix=f"{message.message_id}-table-{index}")
+
+    if message.charts:
+        _render_chart_renderer(message.metadata, key_suffix=f"{message.message_id}-chart")
+
+    if message.artifacts:
+        _render_artifact_renderer(message.artifacts, key_suffix=f"{message.message_id}-artifact")
+
+    if message.trace or message.metadata:
+        _render_trace_panel(message.trace or message.metadata, key_suffix=f"{message.message_id}-trace")
+
+
+def _render_chat_message(message: MessageView) -> None:
+    if message.role == "assistant":
+        left, right = st.columns([0.82, 0.18], gap="small")
+        target = left
+        shell_class = "chat-shell chat-shell--assistant"
+    else:
+        left, right = st.columns([0.18, 0.82], gap="small")
+        target = right
+        shell_class = "chat-shell chat-shell--user"
+
+    if message.streaming:
+        shell_class += " chat-shell--streaming"
+    if message.status == "error":
+        shell_class += " chat-shell--error"
+
+    with target:
+        st.markdown(f'<div class="{shell_class}">', unsafe_allow_html=True)
+        with st.chat_message(message.role, avatar=None):
             st.markdown(
-                """
-                <div class="empty-state empty-state--compact">
-                  <div class="empty-state__title">Pending response</div>
-                  <div class="empty-state__body">The model has not returned this turn yet.</div>
+                f"""
+                <div class="message-header">
+                  <span class="message-role">{escape(message.role)}</span>
+                  <span class="message-time">{escape(_fmt_time(message.timestamp))}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            continue
+            if message.role == "assistant":
+                _render_assistant_message(message)
+            else:
+                _render_user_message(message)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown(
-            f"""
-            <div class="history-card history-card--assistant">
-              <div class="history-card__top">
-                <span class="history-card__role">assistant</span>
-                <span class="history-card__meta">{_fmt_time(assistant_message.created_at)}</span>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(assistant_message.content)
-        preview = turn.metadata.get("dataframe_preview") or []
-        if preview:
-            st.dataframe(preview, use_container_width=True, hide_index=True)
-        chart_source: Any | None = last_result if last_result is not None and index == len(state.turns) - 1 else turn.metadata
-        chart_debug = _chart_debug_from_response(chart_source) or dict(turn.metadata.get("chart_debug") or {})
-        chart_rendered = False
-        if (
-            chart_debug.get("chart_requested")
-            or turn.metadata.get("plot_spec")
-            or turn.metadata.get("plot_data")
-            or chart_source is not None
-        ):
-            chart_rendered = _render_chart_from_response(chart_source, chart_debug=chart_debug)
-            turn.metadata["chart_debug"] = chart_debug
-            turn.debug_detailed.setdefault("chart_debug", chart_debug)
-            plot_error = chart_debug.get("plot_error") or turn.metadata.get("plot_error")
-            if plot_error:
-                st.warning(f"Chart generation failed: {plot_error}")
-            elif chart_debug.get("chart_requested") and not chart_rendered:
-                failure_stage = chart_debug.get("chart_failure_stage") or "ui_render_or_layout"
-                failure_reason = chart_debug.get("chart_failure_reason") or "chart requested but did not render"
-                chart_debug["chart_failure_stage"] = failure_stage
-                chart_debug["chart_failure_reason"] = failure_reason
-                st.warning(f"Chart render issue ({failure_stage}): {failure_reason}")
-        footer_parts = []
-        if turn.metadata.get("model"):
-            footer_parts.append(str(turn.metadata["model"]))
-        if turn.metadata.get("row_count") is not None:
-            footer_parts.append(f"{turn.metadata['row_count']} rows")
-        footer_parts.append(_fmt_time(assistant_message.created_at))
-        st.markdown(
-            f"<div class=\"history-card__footer\">{escape(' | '.join(footer_parts))}</div>",
-            unsafe_allow_html=True,
-        )
-        with st.expander("Trace", expanded=False):
-            st.code(_safe_json(turn.debug_detailed or {}), language="json")
-def render_result_panel(result: Any | None) -> None:
+
+def render_conversation_history(state: ConversationState, last_result: Any | None = None) -> None:
+    _ensure_turn_ui_state(state)
     st.markdown(
         """
-        <div class="panel-title">Output</div>
-        <div class="panel-subtitle">The latest assistant output and future result artifacts will live here.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    response = _response_payload(result)
-    if response is None:
-        st.markdown(
-            """
-            <div class="empty-state empty-state--compact">
-              <div class="empty-state__title">No output yet</div>
-              <div class="empty-state__body">Run a prompt to populate the output inspector.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    response_dict = _response_payload_dict(response)
-    text = response_dict.get("text") or ""
-    chart_debug = _chart_debug_from_response(response)
-    st.markdown(
-        f"""
-        <div class="inspector-card">
-          <div class="inspector-card__title">Latest response</div>
-          <div class="inspector-card__body">{escape(str(text))}</div>
+        <div class="conversation-shell">
+          <div class="conversation-title">Conversation</div>
+          <div class="conversation-subtitle">One message flow for history, streaming, charts, tables, and trace.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    if response_dict.get("dataframe_preview"):
+    views = build_message_views(state)
+    if not views:
         st.markdown(
-            f"""
-            <div class="inspector-card">
-              <div class="inspector-card__title">Table preview</div>
-              <div class="inspector-card__body">
-                {response_dict.get('row_count', 0)} rows | {len(response_dict.get('columns') or [])} columns
-              </div>
+            """
+            <div class="chat-empty-state">
+              <div class="chat-empty-state__title">Start a conversation</div>
+              <div class="chat-empty-state__body">Ask a question, attach a file, and the reply will stay inline here.</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.dataframe(response_dict["dataframe_preview"], use_container_width=True, hide_index=True)
-    chart_rendered = _render_chart_from_response(result, chart_debug=chart_debug)
-    if response_dict.get("plot_error"):
-        st.warning(f"Chart generation failed: {response_dict['plot_error']}")
-    elif chart_debug.get("chart_requested") and not chart_rendered:
-        failure_stage = chart_debug.get("chart_failure_stage") or "ui_render_or_layout"
-        failure_reason = chart_debug.get("chart_failure_reason") or "chart requested but did not render"
-        chart_debug["chart_failure_stage"] = failure_stage
-        chart_debug["chart_failure_reason"] = failure_reason
-        st.warning(f"Chart render issue ({failure_stage}): {failure_reason}")
-    plot_backend = response_dict.get("plot_backend") or chart_debug.get("plot_backend")
-    plot_kind = response_dict.get("plot_kind") or chart_debug.get("plot_kind")
-    if plot_backend == "seaborn":
-        with st.expander("Latest plot artifact", expanded=False):
-            if response_dict.get("plot_image_base64"):
-                st.caption(f"backend={plot_backend} | kind={plot_kind or '--'}")
-                _render_plot_image_base64(str(response_dict["plot_image_base64"]), mime_type=response_dict.get("plot_image_mime_type"))
-            if response_dict.get("plot_code"):
-                st.code(str(response_dict["plot_code"]), language="json")
-            elif response_dict.get("plot_meta"):
-                st.code(_safe_json(response_dict["plot_meta"]), language="json")
-    elif response_dict.get("plot_code"):
-        with st.expander("Latest plot spec", expanded=False):
-            st.code(str(response_dict["plot_code"]), language="json")
-    elif response_dict.get("plot_spec") and not chart_rendered:
-        with st.expander("Latest plot spec", expanded=False):
-            st.code(_safe_json(response_dict["plot_spec"]), language="json")
-
-
-def render_uploaded_files_panel(uploaded_contexts: list[UploadedFileContext], result: Any | None = None) -> None:
-    st.markdown(
-        """
-        <div class="panel-title">Uploaded Files</div>
-        <div class="panel-subtitle">Context files currently available to the agent.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if not uploaded_contexts:
-        render_upload_cards([], compact=True)
         return
-    table_lookup = _registered_table_lookup(result)
-    for item in uploaded_contexts:
-        render_upload_cards([item], compact=True)
-        if not item.is_tabular:
-            continue
-        table_info = table_lookup.get(item.file_name) or table_lookup.get(item.table_name or "")
-        profile = item.semantic_profile or (table_info.get("semantic_profile") if table_info else {})
-        normalization_report = table_info.get("normalization_report") if table_info else {}
-        if profile or normalization_report:
-            with st.expander(f"Column profile: {item.file_name}", expanded=False):
-                _render_profile_summary(profile or {}, normalization_report if isinstance(normalization_report, dict) else {})
 
+    for message in views:
+        _render_chat_message(message)
+
+
+def render_result_panel(result: Any | None) -> None:
+    response = _response_payload(result)
+    if response is None:
+        st.markdown('<div class="empty-card">No output yet.</div>', unsafe_allow_html=True)
+        return
+
+    response_dict = _response_payload_dict(response)
+    if response_dict.get("text"):
+        st.markdown(response_dict["text"])
+    if response_dict.get("dataframe_preview"):
+        _render_table_renderer(
+            {
+                "label": "Latest table preview",
+                "rows": response_dict["dataframe_preview"],
+                "row_count": response_dict.get("row_count"),
+                "columns": response_dict.get("columns") or [],
+            },
+            key_suffix="latest",
+        )
+    chart_debug = _chart_debug_from_response(response)
+    has_plot_object = getattr(response, "plot_object", None) is not None
+    if (
+        chart_debug.get("chart_requested")
+        or response_dict.get("plot_spec")
+        or response_dict.get("plot_data")
+        or response_dict.get("plot_image_base64")
+        or response_dict.get("plot_backend")
+        or has_plot_object
+    ):
+        _render_chart_renderer(response_dict | {"plot_object": getattr(response, "plot_object", None)}, key_suffix="latest-chart")

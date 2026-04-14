@@ -1,6 +1,7 @@
 from full_stack_data_agent.app.chat_service import ChatService
 from full_stack_data_agent.app.runtime_models import DatabaoSessionSnapshot, DatabaoTurnResult
 from full_stack_data_agent.config.settings import get_settings
+from full_stack_data_agent.context.upload_processor import process_uploaded_file
 from full_stack_data_agent.llm.models import ProviderHealth
 
 
@@ -21,7 +22,7 @@ class FakeRuntime:
         self.ask_calls.append((conversation_id, query))
         return (
             DatabaoTurnResult(
-                text="Databao handled this query.",
+                text="Databao handled this query. It also explains the result.\nA final note appears here.",
                 dataframe_preview=[{"a": 1}],
                 columns=["a"],
                 row_count=1,
@@ -33,6 +34,27 @@ class FakeRuntime:
                 executor_type="lighthouse",
             ),
         )
+
+    def ask_stream(self, conversation_id: str, query: str, *, uploaded_contexts, prior_turns=None):
+        self.ask_calls.append((conversation_id, query, "stream"))
+        yield {"type": "chunk", "text": "Databao handled this query. "}
+        yield {"type": "chunk", "text": "It also explains the result.\n"}
+        yield {"type": "chunk", "text": "A final note appears here."}
+        yield {
+            "type": "final",
+            "result": DatabaoTurnResult(
+                text="Databao handled this query. It also explains the result.\nA final note appears here.",
+                dataframe_preview=[{"a": 1}],
+                columns=["a"],
+                row_count=1,
+                thread_meta={"source": "databao"},
+            ),
+            "snapshot": DatabaoSessionSnapshot(
+                conversation_id=conversation_id,
+                llm_name="ollama:gemma4:e4b",
+                executor_type="lighthouse",
+            ),
+        }
 
 
 def test_chat_service_uses_databao_runtime() -> None:
@@ -46,5 +68,77 @@ def test_chat_service_uses_databao_runtime() -> None:
     assert fake_runtime.ask_calls
     assert result.last_databao_result is not None
     assert result.last_databao_result.used_databao is True
+    assert result.stream_mode == "one_shot"
     assert state.turns[-1].metadata["used_databao"] is True
     assert len(fake_runtime.ask_calls[0]) == 2
+
+
+def test_chat_service_streams_chunks_and_preserves_final_result() -> None:
+    service = ChatService(get_settings())
+    fake_runtime = FakeRuntime()
+    service._runtime = fake_runtime  # type: ignore[attr-defined]
+    state = service.create_state()
+    upload = process_uploaded_file("revenue.csv", b"month,revenue\nJan,10\nFeb,12\nMar,15\n", "text/csv")
+    assert upload is not None
+
+    chunks = list(
+        service.send_message_stream(
+            state,
+            "plot revenue by month",
+            uploaded_contexts=[upload],
+        )
+    )
+
+    cached_result = state.debug_state.pop("_last_chat_service_result", None)
+
+    assert fake_runtime.ask_calls
+    assert len(chunks) >= 2
+    assert all(isinstance(chunk, str) and chunk for chunk in chunks)
+    assert cached_result is not None
+    assert cached_result.last_databao_result is not None
+    assert cached_result.last_databao_result.text.startswith("Databao handled this query.")
+    assert cached_result.stream_mode == "streaming"
+    assert state.debug_state["_streaming_mode"] == "streaming"
+    assert state.turns[-1].metadata["used_databao"] is True
+
+
+def test_chat_service_creates_inline_streaming_placeholder_before_iteration() -> None:
+    service = ChatService(get_settings())
+    fake_runtime = FakeRuntime()
+    service._runtime = fake_runtime  # type: ignore[attr-defined]
+    state = service.create_state()
+
+    stream = service.send_message_stream(state, "show revenue", uploaded_contexts=[])
+
+    assert state.turns[-1].user_message.content == "show revenue"
+    assert state.turns[-1].assistant_message is not None
+    assert state.turns[-1].assistant_message.status == "streaming"
+    assert state.turns[-1].assistant_message.content == ""
+    assert state.turns[-1].metadata["status"] == "streaming"
+
+    list(stream)
+
+    assert state.turns[-1].assistant_message is not None
+    assert state.turns[-1].assistant_message.status == "complete"
+    assert state.turns[-1].assistant_message.content.startswith("Databao handled this query.")
+    assert state.turns[-1].metadata["status"] == "complete"
+
+
+def test_chat_service_marks_streaming_errors_on_same_assistant_message() -> None:
+    class BrokenRuntime(FakeRuntime):
+        def ask_stream(self, conversation_id: str, query: str, *, uploaded_contexts, prior_turns=None):
+            raise RuntimeError("backend unavailable")
+
+        def ask(self, conversation_id: str, query: str, *, uploaded_contexts, prior_turns=None):
+            raise RuntimeError("backend unavailable")
+
+    service = ChatService(get_settings())
+    service._runtime = BrokenRuntime()  # type: ignore[attr-defined]
+    state = service.create_state()
+
+    list(service.send_message_stream(state, "show revenue", uploaded_contexts=[]))
+
+    assert state.turns[-1].assistant_message is not None
+    assert state.turns[-1].assistant_message.status == "error"
+    assert "Request failed" in state.turns[-1].assistant_message.content
+    assert state.turns[-1].metadata["status"] == "error"

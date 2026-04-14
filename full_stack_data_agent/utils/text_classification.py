@@ -28,34 +28,36 @@ DATETIME_HINT_RE = re.compile(
     r"|(^\d{4}-\d{2}$)"
 )
 
-EXPLICIT_VISUALIZATION_MARKERS = (
+EXPLICIT_CHART_REQUEST_MARKERS = (
     "plot",
     "chart",
     "graph",
-    "visual",
     "visualize",
     "visualization",
     "visualisation",
     "histogram",
-    "scatter",
+    "scatter plot",
     "bar chart",
     "line chart",
     "heatmap",
     "box plot",
-    "distribution",
+    "violin plot",
+    "count plot",
     "画图",
     "绘图",
-    "图表",
-    "分布图",
     "直方图",
     "散点图",
     "热力图",
     "柱状图",
+    "条形图",
     "折线图",
     "箱线图",
+    "小提琴图",
 )
 
-CHART_INTENT_MARKERS = EXPLICIT_VISUALIZATION_MARKERS
+# Backward-compatible aliases for existing imports.
+EXPLICIT_VISUALIZATION_MARKERS = EXPLICIT_CHART_REQUEST_MARKERS
+CHART_INTENT_MARKERS = EXPLICIT_CHART_REQUEST_MARKERS
 
 
 def series_fullmatch(series: pd.Series, pattern: re.Pattern[str]) -> pd.Series:

@@ -1,13 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import hashlib
 import io
 import json
+import queue
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from io import StringIO
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -41,13 +44,24 @@ if TYPE_CHECKING:
 
 
 _DELIVERABLE_MARKERS = (
-    "你最终至少要回答",
-    "最终至少要回答",
-    "请回答以下问题",
-    "请回答下列问题",
-    "你需要回答",
-    "最后说明",
-    "最后回答",
+    "deliverable",
+    "deliverables",
+    "requirement",
+    "requirements",
+    "task",
+    "tasks",
+    "query",
+    "question",
+    "query:",
+    "question:",
+    "要求",
+    "任务",
+    "查询",
+    "请回答",
+    "请分析",
+    "请解释",
+    "请说明",
+    "回答以下",
     "you must answer",
     "please answer the following",
     "please answer the questions",
@@ -56,29 +70,24 @@ _DELIVERABLE_MARKERS = (
     "final answer must include",
 )
 
-_CHART_INTENT_MARKERS = (
-    "plot",
-    "chart",
-    "graph",
-    "distribution",
-    "histogram",
-    "scatter",
-    "bar chart",
-    "line chart",
-    "heatmap",
-    "visualize",
-    "visualisation",
-    "visualization",
-    "画图",
-    "绘图",
-    "图表",
-    "分布图",
-    "直方图",
-    "散点图",
-    "热力图",
-    "柱状图",
-    "折线图",
-    "箱线图",
+_DELIVERABLE_TRIGGER_MARKERS = (
+    "query:",
+    "question:",
+    "要求:",
+    "任务:",
+    "查询:",
+    "解释:",
+    "画图:",
+    "分析:",
+    "请回答:",
+    "please answer",
+    "answer the following",
+    "follow the following",
+    "1.",
+    "1)",
+    "a.",
+    "- ",
+    "* ",
 )
 
 _QUESTION_STOPWORDS = {
@@ -86,10 +95,8 @@ _QUESTION_STOPWORDS = {
     "are",
     "based",
     "be",
-    "does",
-    "do",
-    "explain",
-    "following",
+    "data",
+    "final",
     "for",
     "from",
     "give",
@@ -117,42 +124,16 @@ _QUESTION_STOPWORDS = {
     "with",
     "you",
     "your",
-    "answer",
-    "analysis",
-    "based",
-    "data",
-    "directly",
-    "final",
-    "question",
-    "summary",
-    "the",
-    "最終",
-    "最终",
-    "至少",
     "回答",
-    "以下",
-    "请",
-    "请你",
     "请问",
-    "需要",
-    "说明",
-    "分析",
-    "结果",
-    "结论",
-    "直接",
+    "请回答",
+    "请说明",
+    "请分析",
+    "根据",
     "基于",
-    "数据",
-    "告诉",
-    "一下",
-    "什么",
-    "哪个",
-    "哪一个",
-    "哪种",
-    "是否",
-    "如何",
+    "整体",
     "大致",
-    "所有",
-    "问题",
+    "最终",
 }
 
 _DESCRIPTION_CATEGORICAL_VALUE_LIMIT = 10
@@ -175,6 +156,23 @@ class _DatabaoSession:
     thread_reset_reason: str | None = None
 
 
+class _StreamingTextWriter:
+    def __init__(self, on_text_chunk: Any):
+        self._on_text_chunk = on_text_chunk
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def on_text_chunk(self, text: str) -> None:
+        if not text:
+            return
+        if callable(self._on_text_chunk):
+            self._on_text_chunk(text)
+
+
 class DatabaoRuntime:
     def __init__(self, settings: Settings, *, executor_type: str = "lighthouse"):
         self._settings = settings
@@ -183,6 +181,170 @@ class DatabaoRuntime:
         self._description_registry: dict[str, set[str]] = {}
         self._fallback_domain_warning: str | None = None
         self._provider_health_cache: dict[str, tuple[float, ProviderHealth]] = {}
+
+    @staticmethod
+    def _looks_like_chinese(text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _trigger_explicit_deliverable_extraction(self, query: str) -> bool:
+        lowered = query.lower()
+        list_pattern = bool(re.search(r"(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+\S", query))
+        section_pattern = any(
+            marker in query
+            for marker in ("查询:", "问题:", "要求:", "任务:", "任务清单:", "tasks:", "requirements:")
+        )
+        marker_hits = sum(1 for marker in _DELIVERABLE_TRIGGER_MARKERS if marker in lowered or marker in query)
+        return list_pattern or section_pattern or marker_hits >= 2
+
+    def _llm_json(self, llm_config: "LLMConfig" | None, messages: list[Any]) -> dict[str, Any]:
+        if llm_config is None:
+            raise ValueError("LLM config is required for structured planning")
+
+        from databao.agent.executors.llm import call_model_with_retry
+
+        model = llm_config.new_chat_model()
+        response = call_model_with_retry(model, messages)
+        raw_text = getattr(response, "content", response)
+        if isinstance(raw_text, list):
+            raw_text = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in raw_text)
+        if not isinstance(raw_text, str):
+            raw_text = str(raw_text)
+
+        parsed = self._extract_first_json_object(raw_text)
+        if parsed is None:
+            raise ValueError("LLM response did not contain valid JSON")
+        return parsed
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+        start = text.find("{")
+        while start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for index in range(start, len(text)):
+                char = text[index]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif char == "\\":
+                        escape = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                    continue
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(text[start : index + 1])
+                        except json.JSONDecodeError:
+                            break
+                        if isinstance(parsed, dict):
+                            return parsed
+                        break
+            start = text.find("{", start + 1)
+        return None
+
+    def _build_deliverable_extraction_messages(self, query: str) -> list[Any]:
+        prompt = (
+            "Extract the user's explicit deliverables as concise grounded items.\n"
+            "Return only JSON with the shape:\n"
+            '{"language":"zh","deliverables":["..."]}\n'
+            "Rules:\n"
+            "- Keep deliverables at the user's intended granularity.\n"
+            "- Do not return the full original text.\n"
+            "- Do not invent new requirements.\n"
+            "- Preserve the main language of the query.\n"
+            f"Query:\n{query}\n"
+        )
+        return [
+            HumanMessage(content="You extract structured deliverables from user questions."),
+            HumanMessage(content=prompt),
+        ]
+
+    def _extract_explicit_deliverables_with_llm(
+        self,
+        query: str,
+        *,
+        llm_config: "LLMConfig" | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        debug = {"source": "legacy_fallback", "language": None}
+        if llm_config is None or not self._trigger_explicit_deliverable_extraction(query):
+            return [], debug
+
+        try:
+            payload = self._llm_json(llm_config, self._build_deliverable_extraction_messages(query))
+            deliverables = payload.get("deliverables", [])
+            if not isinstance(deliverables, list):
+                raise ValueError("deliverables must be a list")
+            items = [self._normalize_whitespace(str(item)) for item in deliverables if self._normalize_whitespace(str(item))]
+            debug["source"] = "llm"
+            debug["language"] = payload.get("language")
+            return items, debug
+        except Exception as exc:
+            debug["error"] = str(exc)
+            return [], debug
+
+    def _judge_clause_coverage_with_llm(
+        self,
+        query: str,
+        clause: str,
+        assistant_text: str,
+        *,
+        llm_config: "LLMConfig" | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        debug = {"source": "lexical_fallback", "reason": None}
+        if llm_config is None:
+            return False, debug
+        prompt = (
+            "Judge whether the assistant answer semantically covers the user clause.\n"
+            "Return only JSON in this format:\n"
+            '{"covered": true, "reason": "..." }\n'
+            "Semantically equivalent wording counts as covered.\n"
+            "Do not require exact wording.\n"
+            f"User query:\n{query}\n\nClause:\n{clause}\n\nAssistant answer:\n{assistant_text}\n"
+        )
+        try:
+            payload = self._llm_json(llm_config, [HumanMessage(content=prompt)])
+            covered = bool(payload.get("covered", False))
+            debug["source"] = "llm"
+            debug["reason"] = payload.get("reason")
+            return covered, debug
+        except Exception as exc:
+            debug["error"] = str(exc)
+            return False, debug
+
+    def _build_follow_up_messages(self, query: str, missing_clauses: list[str]) -> list[Any]:
+        language = "zh" if self._looks_like_chinese(query + " " + " ".join(missing_clauses)) else "en"
+        prompt = (
+            "Write a short follow-up that answers only the missing clauses using the same dataframe.\n"
+            "Return only JSON in the form:\n"
+            '{"follow_up":"..."}\n'
+            "Rules:\n"
+            "- Stay in the same language as the query.\n"
+            "- Keep it short and grounded.\n"
+            "- Do not restate the entire table.\n"
+            "- Do not invent data.\n"
+            f"Language: {language}\n"
+            f"Original query:\n{query}\n\nMissing clauses:\n- " + "\n- ".join(missing_clauses)
+        )
+        return [HumanMessage(content=prompt)]
+
+    def _template_follow_up(self, query: str, missing_clauses: list[str]) -> str:
+        if self._looks_like_chinese(query + " " + " ".join(missing_clauses)):
+            bullets = "； ".join(missing_clauses)
+            return f"请只基于同一个 dataframe 补充未回答的部分：{bullets}。不要重述整张表。"
+        bullets = "; ".join(missing_clauses)
+        return f"Please answer the missing points from the same dataframe only: {bullets}. Do not restate the full table."
 
     def provider_status(self) -> ProviderHealth:
         dependency_status = check_runtime_dependencies()
@@ -244,6 +406,7 @@ class DatabaoRuntime:
         *,
         uploaded_contexts: list[UploadedFileContext] | None = None,
         prior_turns: list[ConversationTurn] | None = None,
+        stream_writer: Any | None = None,
     ) -> tuple[DatabaoTurnResult, DatabaoSessionSnapshot]:
         self._ensure_runtime_ready()
         uploaded = uploaded_contexts or []
@@ -254,7 +417,7 @@ class DatabaoRuntime:
             prior_turns=history_turns,
         )
         try:
-            result = self._run_turn(session, query)
+            result = self._run_turn(session, query, stream_writer=stream_writer)
             return result, self._snapshot(session)
         except Exception as exc:
             fallback_result = self._maybe_retry_with_fallback(
@@ -264,10 +427,48 @@ class DatabaoRuntime:
                 history_turns,
                 session,
                 exc,
+                stream_writer=stream_writer,
             )
             if fallback_result is not None:
                 return fallback_result
             raise
+
+    def ask_stream(
+        self,
+        conversation_id: str,
+        query: str,
+        *,
+        uploaded_contexts: list[UploadedFileContext] | None = None,
+        prior_turns: list[ConversationTurn] | None = None,
+    ):
+        event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        def _emit_chunk(text: str) -> None:
+            if text:
+                event_queue.put({"type": "chunk", "text": text})
+
+        stream_writer = _StreamingTextWriter(_emit_chunk)
+
+        def _worker() -> None:
+            try:
+                result, snapshot = self.ask(
+                    conversation_id,
+                    query,
+                    uploaded_contexts=uploaded_contexts,
+                    prior_turns=prior_turns,
+                    stream_writer=stream_writer,
+                )
+                event_queue.put({"type": "final", "result": result, "snapshot": snapshot})
+            except Exception as exc:
+                event_queue.put({"type": "error", "error": str(exc)})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        while True:
+            event = event_queue.get()
+            yield event
+            if event.get("type") in {"final", "error"}:
+                break
 
     def _ensure_session(
         self,
@@ -428,19 +629,38 @@ class DatabaoRuntime:
         self._provider_health_cache[resolved_name] = (now, health)
         return health
 
-    def _run_turn(self, session: _DatabaoSession, query: str) -> DatabaoTurnResult:
+    @contextmanager
+    def _streaming_thread_writer(self, session: _DatabaoSession, stream_writer: Any | None):
+        thread = session.thread
+        previous_writer = getattr(thread, "_writer", None)
+        if stream_writer is not None:
+            thread._writer = stream_writer
+        try:
+            yield
+        finally:
+            if stream_writer is not None:
+                thread._writer = previous_writer
+
+    def _run_turn(self, session: _DatabaoSession, query: str, *, stream_writer: Any | None = None) -> DatabaoTurnResult:
         chart_requested = self._has_explicit_chart_intent(query)
         chart_intent = self._extract_chart_intent(query)
-        thread = session.thread.ask(query)
-        dataframe = thread.df(rows_limit=200)
-        plot_result, plot_error = self._maybe_collect_plot(thread, query)
-        if plot_result is None and plot_error is None:
-            auto_plot_result = self._auto_visualization_result(thread)
-            if auto_plot_result is not None:
-                plot_result = auto_plot_result
-                chart_requested = True
-        thread_meta = thread.meta()
-        text, completion_validation = self._complete_response(thread, query, thread.text(), dataframe)
+        with self._streaming_thread_writer(session, stream_writer):
+            thread = session.thread.ask(query)
+            dataframe = thread.df(rows_limit=200)
+            plot_result, plot_error = self._maybe_collect_plot(thread, query)
+            if plot_result is None and plot_error is None:
+                auto_plot_result = self._auto_visualization_result(thread)
+                if auto_plot_result is not None:
+                    plot_result = auto_plot_result
+                    chart_requested = True
+            thread_meta = thread.meta()
+            text, completion_validation = self._complete_response(
+                thread,
+                query,
+                thread.text(),
+                dataframe,
+                llm_config=session.agent.llm_config,
+            )
 
         preview = dataframe.head(10).to_dict(orient="records") if dataframe is not None else None
         columns = [str(column) for column in dataframe.columns] if dataframe is not None else None
@@ -450,6 +670,9 @@ class DatabaoRuntime:
         plot_data_frame = getattr(plot_result, "spec_df", None) if plot_result is not None else None
         plot_data = plot_data_frame.to_dict(orient="records") if plot_data_frame is not None else None
         plot_meta = getattr(plot_result, "meta", None) if plot_result is not None else None
+        visualizer_chart_debug = dict(plot_meta.get("chart_debug") or {}) if isinstance(plot_meta, dict) else {}
+        visualizer_plot_error = str(plot_meta.get("plot_error")) if isinstance(plot_meta, dict) and plot_meta.get("plot_error") else None
+        effective_plot_error = visualizer_plot_error or plot_error
         plot_backend = self._plot_backend(plot_result)
         plot_kind = self._plot_kind(plot_result, plot_spec, plot_meta)
         plot_image_base64, plot_image_mime_type = self._plot_image_artifact(plot_result)
@@ -462,7 +685,9 @@ class DatabaoRuntime:
                 or plot_image_base64 is not None
             )
         )
-        chart_generated = plot_result is not None and plot_error is None
+        planner_status = visualizer_chart_debug.get("planner_status")
+        upstream_chart_failed = planner_status in {"planning_failed", "schema_parse_failed", "validation_failed", "render_failed"}
+        chart_generated = plot_result is not None and effective_plot_error is None and not upstream_chart_failed
 
         session_provider = getattr(session, "provider_name", None) or self._settings.llm_provider
         resolved = self._resolve_provider_config(session_provider)
@@ -486,17 +711,30 @@ class DatabaoRuntime:
             plot_backend=plot_backend,
             plot_kind=plot_kind,
             plot_image_base64=plot_image_base64,
-            plot_error=plot_error,
+            plot_error=effective_plot_error,
         )
         chart_failure_stage = None
         chart_failure_reason = None
         if chart_requested:
-            if plot_result is None and plot_error is None:
+            if upstream_chart_failed:
+                chart_failure_stage = str(planner_status)
+                validation_errors = visualizer_chart_debug.get("validation_errors") or []
+                render_error = visualizer_chart_debug.get("render_error")
+                planner_error = visualizer_chart_debug.get("planner_error")
+                if render_error:
+                    chart_failure_reason = str(render_error)
+                elif validation_errors:
+                    chart_failure_reason = "; ".join(str(error) for error in validation_errors)
+                elif planner_error:
+                    chart_failure_reason = str(planner_error)
+                else:
+                    chart_failure_reason = "chart generation failed upstream"
+            elif plot_result is None and effective_plot_error is None:
                 chart_failure_stage = "generation_failed"
                 chart_failure_reason = "chart request was detected but no chart artifact was produced"
-            elif plot_error:
+            elif effective_plot_error:
                 chart_failure_stage = "generation_failed"
-                chart_failure_reason = plot_error
+                chart_failure_reason = effective_plot_error
             elif not chart_renderable:
                 chart_failure_stage = "generation_failed"
                 chart_failure_reason = "chart artifact is present but not renderable"
@@ -521,8 +759,25 @@ class DatabaoRuntime:
             "chart_container_height": 360,
             "chart_failure_stage": chart_failure_stage,
             "chart_failure_reason": chart_failure_reason,
-            "plot_error": plot_error,
+            "plot_error": effective_plot_error,
+            "planner": visualizer_chart_debug.get("planner"),
+            "planner_status": planner_status,
+            "parsed_plan": visualizer_chart_debug.get("parsed_plan"),
+            "final_plan": visualizer_chart_debug.get("final_plan"),
+            "validation_errors": visualizer_chart_debug.get("validation_errors"),
+            "render_error": visualizer_chart_debug.get("render_error"),
+            "repair_used": visualizer_chart_debug.get("repair_used"),
+            "raw_planner_response": visualizer_chart_debug.get("raw_planner_response"),
+            "raw_repair_response": visualizer_chart_debug.get("raw_repair_response"),
+            "fallback_blocked": visualizer_chart_debug.get("fallback_blocked"),
+            "fallback_reason": visualizer_chart_debug.get("fallback_reason"),
         }
+        if visualizer_chart_debug:
+            chart_debug.update(visualizer_chart_debug)
+            chart_debug["chart_generated"] = chart_generated
+            chart_debug["chart_failure_stage"] = chart_failure_stage
+            chart_debug["chart_failure_reason"] = chart_failure_reason
+            chart_debug["plot_error"] = effective_plot_error
 
         thread_meta = {
             **thread_meta,
@@ -547,7 +802,7 @@ class DatabaoRuntime:
             plot_kind=plot_kind,
             plot_image_base64=plot_image_base64,
             plot_image_mime_type=plot_image_mime_type,
-            plot_error=plot_error,
+            plot_error=effective_plot_error,
             chart_debug=chart_debug,
             completion_validation=completion_validation,
             thread_meta=thread_meta,
@@ -563,6 +818,8 @@ class DatabaoRuntime:
         _prior_turns: list[ConversationTurn],
         session: _DatabaoSession,
         exc: Exception,
+        *,
+        stream_writer: Any | None = None,
     ) -> tuple[DatabaoTurnResult, DatabaoSessionSnapshot] | None:
         if not self._should_fallback(exc):
             return None
@@ -581,7 +838,7 @@ class DatabaoRuntime:
             provider_name=fallback_provider,
         )
         try:
-            result = self._run_turn(fallback_session, query)
+            result = self._run_turn(fallback_session, query, stream_writer=stream_writer)
         except Exception:
             return None
 
@@ -630,12 +887,20 @@ class DatabaoRuntime:
         return f"{exc.__class__.__name__}: {exc}"
 
     @staticmethod
-    def _extract_chart_intent(query: str) -> str | None:
+    def _explicit_chart_request_marker(query: str) -> str | None:
         lowered = query.lower()
         for marker in CHART_INTENT_MARKERS:
-            if marker in lowered:
+            if re.search(r"[a-z]", marker):
+                pattern = r"(?<![a-z])" + re.escape(marker).replace(r"\ ", r"\s+") + r"(?![a-z])"
+                if re.search(pattern, lowered):
+                    return marker
+            elif marker in query:
                 return marker
         return None
+
+    @classmethod
+    def _extract_chart_intent(cls, query: str) -> str | None:
+        return cls._explicit_chart_request_marker(query)
 
     @staticmethod
     def _build_chart_artifact_id(
@@ -765,9 +1030,12 @@ class DatabaoRuntime:
                 self._register_description_once(domain, description, dedupe_key=dedupe_key)
 
     def _parse_dataframe(self, item: UploadedFileContext) -> pd.DataFrame:
-        if not item.extracted_text.strip():
-            raise ValueError(f"Uploaded file {item.file_name} does not contain readable CSV content.")
-        return pd.read_csv(StringIO(item.extracted_text))
+        payload = item.tabular_payload
+        if payload is None or not payload.strip():
+            raise ValueError(
+                f"Uploaded file {item.file_name} is tabular but does not include a reconstructable payload."
+            )
+        return pd.read_csv(StringIO(payload))
 
     def _replay_prior_turns(self, session: _DatabaoSession, prior_turns: list[ConversationTurn]) -> None:
         replay_messages: list[Any] = []
@@ -861,22 +1129,50 @@ class DatabaoRuntime:
         query: str,
         text: str,
         dataframe: pd.DataFrame | None,
+        *,
+        llm_config: "LLMConfig" | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        clauses = self._extract_explicit_deliverables(query)
+        clauses, extraction_debug = self._extract_explicit_deliverables(query, llm_config=llm_config)
         validation: dict[str, Any] = {
             "explicit_deliverables": clauses,
             "missing_deliverables": [],
             "supplement_added": False,
+            "deliverable_extraction_source": extraction_debug.get("source"),
+            "coverage_judgement_source": None,
+            "follow_up_source": None,
         }
+        if extraction_debug.get("error"):
+            validation["deliverable_extraction_error"] = extraction_debug["error"]
+
+        if not clauses and dataframe is not None and not dataframe.empty:
+            clauses, fallback_debug = self._extract_explicit_deliverables(query)
+            validation["explicit_deliverables"] = clauses
+            validation["deliverable_extraction_source"] = fallback_debug.get("source", "legacy_fallback")
+
         if not clauses or dataframe is None or dataframe.empty:
             return text, validation
 
-        missing = [clause for clause in clauses if not self._response_covers_clause(text, clause)]
+        missing: list[str] = []
+        coverage_reasons: list[str] = []
+        for clause in clauses:
+            covered, judge_debug = self._response_covers_clause(
+                text,
+                clause,
+                query=query,
+                llm_config=llm_config,
+            )
+            validation["coverage_judgement_source"] = judge_debug.get("source")
+            if judge_debug.get("reason"):
+                coverage_reasons.append(str(judge_debug["reason"]))
+            if not covered:
+                missing.append(clause)
         validation["missing_deliverables"] = missing
+        if coverage_reasons:
+            validation["coverage_judgement_reasons"] = coverage_reasons
         if not missing:
             return text, validation
 
-        follow_up = self._build_follow_up(missing)
+        follow_up = self._build_follow_up(query, missing, llm_config=llm_config)
         if follow_up is None:
             return text, validation
 
@@ -897,9 +1193,28 @@ class DatabaoRuntime:
         combined += follow_up_text
         validation["supplement_added"] = True
         validation["follow_up_query"] = follow_up
+        validation["follow_up_source"] = "llm" if llm_config is not None else "template"
         return combined, validation
 
-    def _extract_explicit_deliverables(self, query: str) -> list[str]:
+    def _extract_explicit_deliverables(
+        self,
+        query: str,
+        *,
+        llm_config: "LLMConfig" | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        debug: dict[str, Any] = {
+            "source": "legacy_fallback",
+            "language": "zh" if self._looks_like_chinese(query) else "en",
+        }
+
+        if llm_config is not None and self._trigger_explicit_deliverable_extraction(query):
+            deliverables, llm_debug = self._extract_explicit_deliverables_with_llm(query, llm_config=llm_config)
+            debug.update(llm_debug)
+            if deliverables:
+                return deliverables, debug
+            if llm_debug.get("error"):
+                debug["fallback_reason"] = llm_debug["error"]
+
         lowered = query.lower()
         marker_index: int | None = None
         marker_length = 0
@@ -912,59 +1227,98 @@ class DatabaoRuntime:
                 marker_length = len(marker)
 
         if marker_index is None:
-            return []
+            return [], debug
 
         tail = query[marker_index + marker_length :]
-        tail = tail.lstrip(" \t\r\n：:，,。.!?？-•*")
+        tail = tail.lstrip(" \t\r\n-•*")
         tail = re.sub(r"^[^:\n]{0,80}:\s*", "", tail)
         if not tail:
-            return []
+            return [], debug
+
+        def _is_meaningful_deliverable(text: str) -> bool:
+            candidate = self._normalize_whitespace(text)
+            if not candidate:
+                return False
+            if re.fullmatch(r"[\W_：:，,；;。.!！？、\-•*]+", candidate):
+                return False
+            if len(candidate) == 1 and not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", candidate):
+                return False
+            return True
 
         clauses: list[str] = []
-        for raw_chunk in re.split(r"[\n；;]+", tail):
-            chunk = raw_chunk.strip(" \t\r\n：:，,。.!?？-•*")
+        for raw_chunk in re.split(r"[\n•]+", tail):
+            chunk = raw_chunk.strip(" \t\r\n-•*")
             if not chunk:
                 continue
-            parts = re.split(r"(?<=[?？])\s*", chunk)
+            parts = re.split(r"(?<=[?。.!！？])\s*|(?<=\d[.)])\s*|(?<=：)\s*(?=[A-Za-z0-9\u4e00-\u9fff])", chunk)
             for part in parts:
-                cleaned = part.strip(" \t\r\n：:，,。.!?？-•*")
-                if cleaned:
+                cleaned = part.strip(" \t\r\n-•*")
+                cleaned = re.sub(r"^[：:，,；;\-•*]+", "", cleaned).strip()
+                cleaned = re.sub(r"[：:，,；;]+$", "", cleaned).strip()
+                if _is_meaningful_deliverable(cleaned):
                     clauses.append(cleaned)
 
-        if clauses:
-            return clauses
+        if not clauses:
+            cleaned_tail = tail.strip(" \t\r\n-•*")
+            cleaned_tail = re.sub(r"^[：:，,；;\-•*]+", "", cleaned_tail).strip()
+            clauses = [cleaned_tail] if _is_meaningful_deliverable(cleaned_tail) else []
 
-        cleaned_tail = tail.strip(" \t\r\n：:，,。.!?？-•*")
-        return [cleaned_tail] if cleaned_tail else []
+        return clauses, debug
 
-    def _response_covers_clause(self, text: str, clause: str) -> bool:
+    def _response_covers_clause(
+        self,
+        text: str,
+        clause: str,
+        *,
+        query: str,
+        llm_config: "LLMConfig" | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        covered, judge_debug = self._judge_clause_coverage_with_llm(
+            query,
+            clause,
+            text,
+            llm_config=llm_config,
+        )
+        if judge_debug.get("source") == "llm":
+            return covered, judge_debug
+
         clause_terms = self._extract_significant_terms(clause)
         if not clause_terms:
-            return clause.strip().lower() in text.lower()
+            matched = clause.strip().lower() in text.lower()
+            judge_debug.update(
+                {
+                    "source": "lexical_fallback",
+                    "reason": "Exact substring match" if matched else "No significant terms found",
+                }
+            )
+            return matched, judge_debug
 
         lower_text = text.lower()
-        hits = 0
-        for term in clause_terms:
-            if term.lower() in lower_text:
-                hits += 1
-
+        hits = sum(1 for term in clause_terms if term.lower() in lower_text)
         required_hits = max(1, (len(clause_terms) * 3 + 4) // 5)
-        return hits >= required_hits
+        matched = hits >= required_hits
+        judge_debug.update(
+            {
+                "source": "lexical_fallback",
+                "reason": f"Matched {hits}/{len(clause_terms)} significant terms",
+            }
+        )
+        return matched, judge_debug
 
     def _extract_significant_terms(self, text: str) -> list[str]:
         normalized = re.sub(
-            r"(?:\u662f\u5426|\u5927\u81f4|\u6574\u4f53|\u5927\u7ea6|\u8bf7\u95ee|\u8bf7\u56de\u7b54|\u56de\u7b54|\u6839\u636e|\u57fa\u4e8e|\u4f60\u6700\u7ec8\u81f3\u5c11\u8981\u56de\u7b54)",
+            r"(?:是否|大致|整体|大约|请问|请回答|回答|根据|基于|你最终至少要回答)",
             " ",
             text,
         )
-        normalized = re.sub(r"[,\uFF0C\u3002!\uff01\?？:：;；、/\\\(\)\[\]\{\}\-\u548c\u4e0e\u53ca\u4ee5\u53ca]", " ", normalized)
+        normalized = re.sub(r"[，。!！?？、/\\()\[\]{}\-和与及以及]", " ", normalized)
 
         terms: list[str] = []
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_+-]*|[\u4e00-\u9fff]{2,}", normalized):
-            normalized = token.strip().lower()
-            if len(normalized) < 2:
+            normalized_token = token.strip().lower()
+            if len(normalized_token) < 2:
                 continue
-            if normalized in _QUESTION_STOPWORDS:
+            if normalized_token in _QUESTION_STOPWORDS:
                 continue
             terms.append(token)
 
@@ -978,15 +1332,24 @@ class DatabaoRuntime:
             deduped.append(term)
         return deduped
 
-    def _build_follow_up(self, missing_clauses: list[str]) -> str | None:
+    def _build_follow_up(
+        self,
+        query: str,
+        missing_clauses: list[str],
+        *,
+        llm_config: "LLMConfig" | None = None,
+    ) -> str | None:
         if not missing_clauses:
             return None
-        bullets = "\n".join(f"- {clause}" for clause in missing_clauses)
-        return (
-            "Please answer the missing sub-questions from the same dataframe only. "
-            "Do not restate the full table; give direct grounded answers.\n"
-            f"{bullets}"
-        )
+        if llm_config is not None:
+            try:
+                payload = self._llm_json(llm_config, self._build_follow_up_messages(query, missing_clauses))
+                follow_up = payload.get("follow_up")
+                if isinstance(follow_up, str) and follow_up.strip():
+                    return self._normalize_whitespace(follow_up)
+            except Exception:
+                pass
+        return self._template_follow_up(query, missing_clauses)
 
     def _snapshot(self, session: _DatabaoSession) -> DatabaoSessionSnapshot:
         return DatabaoSessionSnapshot(
@@ -1017,8 +1380,7 @@ class DatabaoRuntime:
         raise ProviderUnavailableError(dependency_status.error or "Missing runtime dependencies.")
 
     def _has_explicit_chart_intent(self, query: str) -> bool:
-        lowered = query.lower()
-        return any(marker in lowered for marker in CHART_INTENT_MARKERS)
+        return self._explicit_chart_request_marker(query) is not None
 
     @staticmethod
     def _profile_columns_by_type(column_hints: dict[str, Any], semantic_type: str) -> list[str]:
@@ -1072,3 +1434,7 @@ class DatabaoRuntime:
         if not stem[0].isalpha():
             stem = f"uploaded_{stem}"
         return stem
+
+
+
+

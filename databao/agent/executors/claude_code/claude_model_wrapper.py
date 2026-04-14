@@ -288,7 +288,11 @@ query_id: The ID of the query to submit.""",
         max_init_query_id = max(self._query_cache) if self._query_cache else 0
         message_log: list[BaseMessage] = []
         submitted_query_result: QueryResult | None = None
-        frontend = TextStreamFrontend({"messages": message_log}, writer=writer)
+        frontend = TextStreamFrontend(
+            {"messages": message_log},
+            writer=writer,
+            on_text_chunk=getattr(writer, "on_text_chunk", None),
+        )
         for message in self.solve(prompt):
             if isinstance(message, ClaudeSystemMessage) and session_id is None:
                 # Child subagents have their own system messages, but we want the parent one only

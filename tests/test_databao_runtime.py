@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sys
 import types
@@ -9,6 +9,7 @@ import pytest
 from full_stack_data_agent.app.dependencies import RuntimeDependencyStatus, check_runtime_dependencies
 from full_stack_data_agent.app.databao_runtime import DatabaoRuntime
 from full_stack_data_agent.config.settings import get_settings
+from databao.agent.core.sources import SourcesManager
 from full_stack_data_agent.context.models import UploadedFileContext
 from full_stack_data_agent.context.semantic_profile import build_semantic_profile
 from full_stack_data_agent.llm.models import ProviderUnavailableError
@@ -201,6 +202,7 @@ def test_runtime_registers_uploaded_dataframe_and_reuses_thread_when_signature_u
         size_bytes=32,
         summary="salary data",
         extracted_text="borough,salary\nQueens,100\nBronx,80\n",
+        tabular_payload="borough,salary\nQueens,100\nBronx,80\n",
         is_tabular=True,
         table_name="salary",
         row_count=2,
@@ -217,6 +219,103 @@ def test_runtime_registers_uploaded_dataframe_and_reuses_thread_when_signature_u
     assert len(runtime._sessions) == 1
     assert first_snapshot.datasource_changed is False
     assert second_snapshot.datasource_changed is False
+
+
+def test_runtime_registers_full_csv_payload_instead_of_preview_markdown(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    fake_thread = FakeThread()
+    fake_domain = FakeDomain()
+    dataframe = pd.DataFrame(
+        {
+            "customer_id": [f"C-{index:03d}" for index in range(1, 13)],
+            "score": list(range(10, 22)),
+        }
+    )
+    preview_text = dataframe.head(5).to_markdown(index=False)
+    payload = dataframe.to_csv(index=False)
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    upload = UploadedFileContext(
+        file_name="customers.csv",
+        mime_type="text/csv",
+        size_bytes=len(payload.encode("utf-8")),
+        summary="customer scores",
+        extracted_text=preview_text,
+        tabular_payload=payload,
+        is_tabular=True,
+        table_name="customers",
+        row_count=len(dataframe),
+        columns=["customer_id", "score"],
+    )
+
+    result, snapshot = runtime.ask("session-csv-payload", "summarize the uploaded file", uploaded_contexts=[upload])
+
+    assert fake_domain.frames
+    assert fake_domain.frames[0][1].shape[0] == len(dataframe)
+    assert snapshot.registered_tables[0].row_count == len(dataframe)
+    assert result.text == "analysis complete"
+
+
+@pytest.mark.parametrize(
+    "file_name,payload,row_count,columns",
+    [
+        ("workbook.xlsx", "name,value\nalpha,1\nbeta,2\n", 2, ["name", "value"]),
+        ("scores.json", "team,score\nA,1\nB,2\nC,3\n", 3, ["team", "score"]),
+    ],
+)
+def test_runtime_registers_tabular_payloads_for_excel_and_json(
+    monkeypatch,
+    file_name: str,
+    payload: str,
+    row_count: int,
+    columns: list[str],
+) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    fake_thread = FakeThread()
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    upload = UploadedFileContext(
+        file_name=file_name,
+        mime_type="application/octet-stream",
+        size_bytes=len(payload.encode("utf-8")),
+        summary="tabular upload",
+        extracted_text="Preview only\n| col | value |\n| --- | --- |\n| alpha | 1 |\n",
+        tabular_payload=payload,
+        is_tabular=True,
+        table_name="uploaded_table",
+        row_count=row_count,
+        columns=columns,
+    )
+
+    result, snapshot = runtime.ask(f"session-{file_name}", "summarize the uploaded file", uploaded_contexts=[upload])
+
+    assert fake_domain.frames
+    assert fake_domain.frames[0][1].shape[0] == row_count
+    assert snapshot.registered_tables[0].row_count == row_count
+    assert result.text == "analysis complete"
+
+
+def test_runtime_parse_dataframe_requires_tabular_payload() -> None:
+    runtime = DatabaoRuntime(get_settings())
+    upload = UploadedFileContext(
+        file_name="preview_only.csv",
+        mime_type="text/csv",
+        size_bytes=48,
+        summary="preview only",
+        extracted_text="| a | b |\n| --- | --- |\n| 1 | 2 |\n",
+        is_tabular=True,
+        table_name="preview_only",
+        row_count=1,
+        columns=["a", "b"],
+    )
+
+    with pytest.raises(ValueError, match="reconstructable payload"):
+        runtime._parse_dataframe(upload)
 
 
 def test_runtime_falls_back_to_ollama_when_primary_provider_raises_provider_error(monkeypatch) -> None:
@@ -248,6 +347,7 @@ def test_runtime_falls_back_to_ollama_when_primary_provider_raises_provider_erro
             size_bytes=32,
             summary="salary data",
             extracted_text="borough,salary\nQueens,100\n",
+            tabular_payload="borough,salary\nQueens,100\n",
             is_tabular=True,
             table_name="salary",
             row_count=1,
@@ -291,6 +391,184 @@ def test_runtime_collects_auto_visualization_without_explicit_chart_intent(monke
     assert result.chart_debug["chart_requested"] is True
     assert result.plot_spec == {"mark": "line"}
     assert result.plot_data == [{"x": 1, "y": 2}, {"x": 2, "y": 3}]
+
+
+def test_runtime_propagates_planning_failed_chart_debug(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    plot_result = type(
+        "PlotResult",
+        (),
+        {
+            "code": "{}",
+            "kind": "barplot",
+            "meta": {
+                "plot_error": "Chart planner did not return valid JSON",
+                "chart_debug": {
+                    "planner": "llm",
+                    "planner_status": "planning_failed",
+                    "validated": False,
+                    "planner_error": "Chart planner did not return valid JSON",
+                    "validation_errors": [],
+                    "fallback_blocked": True,
+                    "raw_planner_response": "not json",
+                },
+            },
+        },
+    )()
+    fake_thread = FakeThread()
+    fake_thread.plot = lambda request=None, **kwargs: plot_result
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask("session-plan-fail", "show a bar chart with x=borough and y=salary", uploaded_contexts=[])
+
+    assert result.chart_debug["planner_status"] == "planning_failed"
+    assert result.chart_debug["fallback_blocked"] is True
+    assert result.chart_debug["chart_generated"] is False
+    assert result.chart_debug["chart_failure_stage"] == "planning_failed"
+    assert "valid JSON" in str(result.chart_debug["chart_failure_reason"])
+
+
+def test_runtime_propagates_schema_parse_failed_chart_debug(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    plot_result = type(
+        "PlotResult",
+        (),
+        {
+            "code": "{}",
+            "kind": "barplot",
+            "meta": {
+                "plot_error": "Chart planner JSON does not match schema",
+                "chart_debug": {
+                    "planner": "llm_json",
+                    "planner_status": "schema_parse_failed",
+                    "validated": False,
+                    "planner_error": "Chart planner JSON does not match schema",
+                    "validation_errors": [],
+                    "fallback_blocked": True,
+                },
+            },
+        },
+    )()
+    fake_thread = FakeThread()
+    fake_thread.plot = lambda request=None, **kwargs: plot_result
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask("session-schema-fail", "show a bar chart with x=borough and y=salary", uploaded_contexts=[])
+
+    assert result.chart_debug["planner_status"] == "schema_parse_failed"
+    assert result.chart_debug["fallback_blocked"] is True
+    assert result.chart_debug["chart_generated"] is False
+    assert result.chart_debug["chart_failure_stage"] == "schema_parse_failed"
+
+
+def test_runtime_propagates_validation_failed_chart_debug(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    plot_result = type(
+        "PlotResult",
+        (),
+        {
+            "code": "{}",
+            "kind": "barplot",
+            "meta": {
+                "plot_error": "User explicitly requested hue=churn_status, but plan omitted it.",
+                "chart_debug": {
+                    "planner": "llm",
+                    "planner_status": "validation_failed",
+                    "validated": False,
+                    "planner_error": "final plan failed validation",
+                    "validation_errors": ["User explicitly requested hue=churn_status, but plan omitted it."],
+                    "fallback_blocked": True,
+                },
+            },
+        },
+    )()
+    fake_thread = FakeThread()
+    fake_thread.plot = lambda request=None, **kwargs: plot_result
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask(
+        "session-validation-fail",
+        "show a grouped bar chart with x=PaymentMethod, y=customer_count, hue=churn_status",
+        uploaded_contexts=[],
+    )
+
+    assert result.chart_debug["planner_status"] == "validation_failed"
+    assert result.chart_debug["chart_generated"] is False
+    assert result.chart_debug["chart_failure_stage"] == "validation_failed"
+    assert "hue" in " ".join(result.chart_debug["validation_errors"]).lower()
+
+
+def test_runtime_propagates_render_failed_chart_debug_even_with_image_artifact(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+
+    class PlotResult:
+        code = "{}"
+        kind = "barplot"
+        meta = {
+            "plot_error": "boom",
+            "chart_debug": {
+                "planner": "llm",
+                "planner_status": "render_failed",
+                "validated": False,
+                "render_error": "boom",
+                "fallback_blocked": True,
+            },
+        }
+
+        @staticmethod
+        def png_base64():
+            return "ZmFrZQ=="
+
+    fake_thread = FakeThread()
+    fake_thread.plot = lambda request=None, **kwargs: PlotResult()
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask("session-render-fail", "show a bar chart with x=borough and y=salary", uploaded_contexts=[])
+
+    assert result.chart_debug["planner_status"] == "render_failed"
+    assert result.chart_debug["chart_generated"] is False
+    assert result.chart_debug["chart_failure_stage"] == "render_failed"
+    assert result.chart_debug["chart_failure_reason"] == "boom"
+
+
+def test_runtime_generic_visual_words_do_not_trigger_plot(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    fake_thread = FakeThread()
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask("session-no-plot-trigger", "Please give a distribution overview and visual summary in text only.")
+
+    assert result.chart_debug["chart_requested"] is False
+    assert fake_thread.plot_requests == []
+
+
+def test_runtime_explicit_chart_request_still_triggers_plot(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    fake_thread = FakeThread()
+    fake_domain = FakeDomain()
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(fake_thread))
+
+    result, _ = runtime.ask("session-explicit-plot-trigger", "show a bar chart with x=borough and y=salary")
+
+    assert result.chart_debug["chart_requested"] is True
+    assert len(fake_thread.plot_requests) == 1
 
 
 def test_drop_session_removes_cached_runtime_state(monkeypatch) -> None:
@@ -348,6 +626,7 @@ def test_runtime_normalizes_uploaded_dataframe_before_registration(monkeypatch) 
         size_bytes=64,
         summary="generic upload",
         extracted_text="label,amount,flag,event_date,record_id,blank_value\nAlpha,1200.50,Yes,2024-01-02,10001, \nBeta,80,No,2024-02-03,10002,\n",
+        tabular_payload="label,amount,flag,event_date,record_id,blank_value\nAlpha,1200.50,Yes,2024-01-02,10001, \nBeta,80,No,2024-02-03,10002,\n",
         is_tabular=True,
         table_name="generic_upload",
         row_count=2,
@@ -403,6 +682,7 @@ def test_runtime_builds_semantic_description_and_stores_profile(monkeypatch) -> 
         size_bytes=96,
         summary="student scores",
         extracted_text="student_id,overall_score,enrollment_date,grade\nS-1001,92,2024-01-02,A\nS-1002,85,2024-02-03,B\nS-1003,78,2024-03-04,B\n",
+        tabular_payload="student_id,overall_score,enrollment_date,grade\nS-1001,92,2024-01-02,A\nS-1002,85,2024-02-03,B\nS-1003,78,2024-03-04,B\n",
         is_tabular=True,
         table_name="student_scores",
         row_count=3,
@@ -468,6 +748,7 @@ def test_runtime_replays_history_when_datasource_changes(monkeypatch) -> None:
         size_bytes=32,
         summary="salary data",
         extracted_text="borough,salary\nQueens,100\n",
+        tabular_payload="borough,salary\nQueens,100\n",
         is_tabular=True,
         table_name="salary",
         row_count=1,
@@ -479,6 +760,7 @@ def test_runtime_replays_history_when_datasource_changes(monkeypatch) -> None:
         size_bytes=40,
         summary="salary data updated",
         extracted_text="borough,salary\nQueens,100\nBronx,80\n",
+        tabular_payload="borough,salary\nQueens,100\nBronx,80\n",
         is_tabular=True,
         table_name="salary_v2",
         row_count=2,
@@ -579,6 +861,7 @@ def test_falls_back_to_in_memory_domain_when_project_domain_is_unsupported(monke
         size_bytes=32,
         summary="salary data",
         extracted_text="borough,salary\nQueens,100\n",
+        tabular_payload="borough,salary\nQueens,100\n",
         is_tabular=True,
         table_name="salary",
         row_count=1,
@@ -590,3 +873,126 @@ def test_falls_back_to_in_memory_domain_when_project_domain_is_unsupported(monke
     assert fake_domain.frames
     assert result.row_count == 1
     assert snapshot.context_build_error == "Only configurable sources from a DCE project are supported."
+
+
+def test_sources_manager_allows_empty_finalize() -> None:
+    manager = SourcesManager()
+
+    manager.finalize()
+
+
+def test_runtime_extracts_deliverables_with_llm(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    monkeypatch.setattr(runtime, "_trigger_explicit_deliverable_extraction", lambda query: True)
+    monkeypatch.setattr(
+        runtime,
+        "_llm_json",
+        lambda llm_config, messages: {
+            "language": "zh",
+            "deliverables": [
+                "\u6309 gender \u5206\u7ec4\u5e76\u8ba1\u7b97\u5b66\u751f\u4eba\u6570\u3001\u5e73\u5747 overall_score\u3001\u5e73\u5747 study_hours_per_day",
+                "\u753b\u4e00\u5f20\u67f1\u72b6\u56fe\uff0cx \u8f74\u662f gender\uff0cy \u8f74\u662f\u5e73\u5747 overall_score",
+                "\u89e3\u91ca\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8\u4ee5\u53ca\u5dee\u8ddd\u5927\u4e0d\u5927",
+            ],
+        },
+    )
+
+    clauses, debug = runtime._extract_explicit_deliverables(
+        "\u8bf7\u5b8c\u6210\u4ee5\u4e0b\u4efb\u52a1\uff1a\u6309 gender \u5206\u7ec4\uff0c\u753b\u56fe\u5e76\u89e3\u91ca\u5dee\u5f02",
+        llm_config=object(),
+    )
+
+    assert clauses == [
+        "\u6309 gender \u5206\u7ec4\u5e76\u8ba1\u7b97\u5b66\u751f\u4eba\u6570\u3001\u5e73\u5747 overall_score\u3001\u5e73\u5747 study_hours_per_day",
+        "\u753b\u4e00\u5f20\u67f1\u72b6\u56fe\uff0cx \u8f74\u662f gender\uff0cy \u8f74\u662f\u5e73\u5747 overall_score",
+        "\u89e3\u91ca\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8\u4ee5\u53ca\u5dee\u8ddd\u5927\u4e0d\u5927",
+    ]
+    assert debug["source"] == "llm"
+    assert debug["language"] == "zh"
+
+
+def test_runtime_falls_back_to_regex_deliverable_extraction_when_llm_fails(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    monkeypatch.setattr(runtime, "_trigger_explicit_deliverable_extraction", lambda query: True)
+    monkeypatch.setattr(runtime, "_llm_json", lambda llm_config, messages: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    clauses, debug = runtime._extract_explicit_deliverables(
+        "\u8bf7\u56de\u7b54\uff1a1. \u6309 gender \u5206\u7ec4\u30022. \u753b\u67f1\u72b6\u56fe\u30023. \u89e3\u91ca\u5dee\u5f02\u3002",
+        llm_config=object(),
+    )
+
+    assert clauses
+    assert any("gender" in clause or "\u67f1\u72b6\u56fe" in clause for clause in clauses)
+    assert debug["source"] == "legacy_fallback"
+    assert "error" in debug
+
+
+def test_runtime_uses_semantic_judge_when_available(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    monkeypatch.setattr(
+        runtime,
+        "_llm_json",
+        lambda llm_config, messages: {
+            "covered": True,
+            "reason": "The answer states that female students have a slightly higher average score.",
+        },
+    )
+
+    covered, debug = runtime._response_covers_clause(
+        "Female students have a slightly higher average score.",
+        "\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8",
+        query="\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8",
+        llm_config=object(),
+    )
+
+    assert covered is True
+    assert debug["source"] == "llm"
+    assert "higher average score" in debug["reason"]
+
+
+def test_runtime_falls_back_to_lexical_coverage_judge_when_llm_fails(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    monkeypatch.setattr(runtime, "_llm_json", lambda llm_config, messages: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    covered, debug = runtime._response_covers_clause(
+        "Female students have a slightly higher average score.",
+        "female students have a slightly higher average score",
+        query="Which gender has the higher average score?",
+        llm_config=object(),
+    )
+
+    assert covered is True
+    assert debug["source"] == "lexical_fallback"
+
+
+def test_runtime_builds_follow_up_in_query_language(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    monkeypatch.setattr(
+        runtime,
+        "_llm_json",
+        lambda llm_config, messages: {"follow_up": "\u8bf7\u53ea\u8865\u5145\u7f3a\u5931\u90e8\u5206\uff0c\u4e0d\u8981\u91cd\u8ff0\u6574\u5f20\u8868\u3002"},
+    )
+
+    follow_up = runtime._build_follow_up(
+        "\u8bf7\u7ee7\u7eed\u5206\u6790\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8",
+        ["\u8bf4\u660e\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8", "\u89e3\u91ca\u5dee\u8ddd\u662f\u5426\u660e\u663e"],
+        llm_config=object(),
+    )
+
+    assert follow_up is not None
+    assert follow_up.startswith("\u8bf7")
+    assert "\u6574\u5f20\u8868" in follow_up
+
+
+def test_runtime_falls_back_to_chinese_follow_up_template_when_llm_fails(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    monkeypatch.setattr(runtime, "_llm_json", lambda llm_config, messages: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    follow_up = runtime._build_follow_up(
+        "\u8bf7\u7ee7\u7eed\u5206\u6790\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8",
+        ["\u8bf4\u660e\u54ea\u4e2a\u6027\u522b\u5e73\u5747\u5206\u66f4\u9ad8", "\u89e3\u91ca\u5dee\u8ddd\u662f\u5426\u660e\u663e"],
+        llm_config=object(),
+    )
+
+    assert follow_up is not None
+    assert follow_up.startswith("\u8bf7\u53ea\u57fa\u4e8e\u540c\u4e00\u4e2a dataframe")

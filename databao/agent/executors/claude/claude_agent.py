@@ -345,7 +345,11 @@ class ClaudeAgentExecutor(DuckDBExecutor):
         )
         new_session_id: str | None = None
         message_log: list[BaseMessage] = []
-        frontend = TextStreamFrontend({"messages": message_log}, writer=writer)
+        frontend = TextStreamFrontend(
+            {"messages": message_log},
+            writer=writer,
+            on_text_chunk=getattr(writer, "on_text_chunk", None),
+        )
         messages = []
         async with ClaudeSDKClient(options=options) as client:
             await client.query(question)

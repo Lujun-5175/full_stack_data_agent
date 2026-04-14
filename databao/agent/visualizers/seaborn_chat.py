@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import io
@@ -19,6 +19,9 @@ from pydantic import Field
 from databao.agent.configs.llm import LLMConfig
 from databao.agent.core import ExecutionResult, VisualisationResult, Visualizer
 from databao.agent.core.visualizer import HistoryMode
+from databao.agent.executors.llm import call_model_with_retry
+from databao.agent.visualizers.chart_contract import ChartPlan
+from databao.agent.visualizers.chart_planner import ChartPlanningError, plan_chart_request
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +31,53 @@ except Exception:  # pragma: no cover
     sns = None
 
 
+_CHART_KINDS = (
+    "histogram",
+    "countplot",
+    "barplot",
+    "lineplot",
+    "scatterplot",
+    "boxplot",
+    "violinplot",
+    "swarmplot",
+    "stripplot",
+    "jointplot",
+    "pairplot",
+    "heatmap",
+)
+
+_CHART_KIND_ALIASES: dict[str, tuple[str, ...]] = {
+    "histogram": ("histogram", "直方图", "histogram chart", "histogram plot"),
+    "countplot": ("countplot", "count plot", "计数图", "频数图"),
+    "barplot": ("grouped bar chart", "grouped bar plot", "barplot", "bar plot", "bar chart", "柱状图", "条形图", "分组柱状图"),
+    "lineplot": ("lineplot", "line plot", "line chart", "折线图"),
+    "scatterplot": ("scatterplot", "scatter plot", "散点图"),
+    "boxplot": ("boxplot", "box plot", "箱线图", "盒图"),
+    "violinplot": ("violinplot", "violin plot", "小提琴图"),
+    "swarmplot": ("swarmplot", "swarm plot", "蜂群图"),
+    "stripplot": ("stripplot", "strip plot", "条带图"),
+    "jointplot": ("jointplot", "joint plot", "联合图"),
+    "pairplot": ("pairplot", "pair plot", "scatter matrix", "成对图"),
+    "heatmap": ("heatmap", "heat map", "热力图", "相关矩阵"),
+}
+
+_REQUEST_FIELD_LABELS = {
+    "x": ("x", "x-axis", "横轴"),
+    "y": ("y", "y-axis", "纵轴"),
+    "hue": ("hue", "color", "colour", "颜色", "色彩"),
+    "value": ("value", "数值", "值"),
+}
+
+
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().strip())
+
+
+def _instruction_request_slice(request: str) -> str:
+    match = re.search(r"Instructions:\s*(.*)$", request, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return request.strip()
 
 
 def _is_dt(series: pd.Series) -> bool:
@@ -63,6 +111,65 @@ def _fig_png_bytes(fig: Any) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=144)
     return buf.getvalue()
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if text is not None:
+                    parts.append(str(text))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
+def _safe_json_loads(text: str) -> dict[str, Any] | None:
+    candidate = _extract_first_json_object(text)
+    if candidate is None:
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class SeabornChatResult(VisualisationResult):
@@ -102,9 +209,501 @@ class SeabornChatResult(VisualisationResult):
 
 
 class SeabornChatVisualizer(Visualizer):
-    def __init__(self, llm_config: LLMConfig | None = None, *, history_mode: HistoryMode = HistoryMode.LAST_QUESTION):
+    def __init__(
+        self,
+        llm_config: LLMConfig | None = None,
+        *,
+        history_mode: HistoryMode = HistoryMode.LAST_QUESTION,
+        allow_semantic_fallback_for_explicit_requests: bool = False,
+    ):
         super().__init__(history_mode=history_mode)
         self._llm_config = llm_config
+        self._allow_semantic_fallback_for_explicit_requests = allow_semantic_fallback_for_explicit_requests
+
+    def _call_chart_planner(self, messages: list[Any]) -> str:
+        if self._llm_config is None:
+            raise RuntimeError("No LLM config available for chart planning")
+        temperature = min(float(self._llm_config.temperature), 0.2)
+        model = self._llm_config.model_copy(update={"temperature": temperature}).new_chat_model()
+        response = call_model_with_retry(model, messages)
+        return _message_text(response)
+
+    @staticmethod
+    def _planner_sample_values(df: pd.DataFrame, limit: int = 5) -> dict[str, list[Any]]:
+        sample: dict[str, list[Any]] = {}
+        for column in df.columns:
+            series = df[column].dropna().head(limit)
+            sample[str(column)] = [str(value) for value in series.tolist()]
+        return sample
+
+    @staticmethod
+    def _column_types(df: pd.DataFrame) -> dict[str, str]:
+        return {str(column): str(df[column].dtype) for column in df.columns}
+
+    @staticmethod
+    def _detect_requested_kind(request: str) -> str | None:
+        lowered = _clean(_instruction_request_slice(request))
+        for kind, aliases in _CHART_KIND_ALIASES.items():
+            for alias in aliases:
+                alias_lower = alias.casefold()
+                if re.search(r"[\u4e00-\u9fff]", alias_lower):
+                    if alias_lower in lowered:
+                        return kind
+                    continue
+                pattern = r"(?<![a-z])" + re.escape(alias_lower).replace(r"\ ", r"\s+") + r"(?![a-z])"
+                if re.search(pattern, lowered):
+                    return kind
+        return None
+
+    @staticmethod
+    def _looks_like_grouped_hue_request(request: str) -> bool:
+        lowered = _clean(request)
+        markers = (
+            "grouped bar",
+            "grouped bar chart",
+            "color by",
+            "group by color",
+            "hue",
+            "分组颜色",
+            "按颜色分组",
+            "按某字段分组着色",
+            "分组柱状图",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _resolve_column_name(requested: str | None, df: pd.DataFrame) -> str | None:
+        if requested is None:
+            return None
+        candidate = requested.strip().strip("\"'`“”’")
+        if not candidate:
+            return None
+        if candidate in df.columns:
+            return str(candidate)
+        lowered = candidate.casefold()
+        for column in df.columns:
+            if str(column).casefold() == lowered:
+                return str(column)
+        compact = re.sub(r"[\s_]+", "", lowered)
+        for column in df.columns:
+            if re.sub(r"[\s_]+", "", str(column).casefold()) == compact:
+                return str(column)
+        return None
+
+    @staticmethod
+    def _looks_like_horizontal_bar_request(request: str) -> bool:
+        lowered = _clean(_instruction_request_slice(request))
+        markers = (
+            "horizontal bar",
+            "horizontal bars",
+            "barh",
+            "横向柱状图",
+            "水平柱状图",
+            "横向条形图",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _extract_category_order(request: str, df: pd.DataFrame) -> list[str]:
+        request_slice = _instruction_request_slice(request)
+        match = re.search(
+            r"(?:category[_\s-]*order|order|排序)\s*(?:=|:|：)\s*([^\n]+)",
+            request_slice,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return []
+        raw = match.group(1).strip()
+        values = [item.strip().strip("\"'`") for item in re.split(r"[>,，,;；]", raw) if item.strip()]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        # pandas>=3.0 removed stack(dropna=...) on DataFrame; use default stack behavior.
+        flattened_values = df.astype("string").stack().tolist()
+        for value in values:
+            for column_value in flattened_values:
+                candidate = str(column_value).strip()
+                if candidate.casefold() == value.casefold() and candidate.casefold() not in seen:
+                    normalized.append(candidate)
+                    seen.add(candidate.casefold())
+                    break
+            else:
+                if value.casefold() not in seen:
+                    normalized.append(value)
+                    seen.add(value.casefold())
+        return normalized
+
+    def _extract_explicit_field_constraints(self, request: str, df: pd.DataFrame) -> dict[str, Any]:
+        request_slice = _instruction_request_slice(request)
+        constraints: dict[str, Any] = {}
+        explicit_kind = self._detect_requested_kind(request_slice)
+        if explicit_kind is not None:
+            constraints["kind"] = explicit_kind
+        patterns = {
+            "kind": r"(?:chart\s*type|chart|kind|plot\s*type|图类型)\s*(?:=|:|：|is|是)\s*([^\n,;，；]+)",
+            "x": r"(?:x|x-axis|横轴)\s*(?:=|:|：|is|是)\s*([^\n,;，；]+)",
+            "y": r"(?:y|y-axis|纵轴)\s*(?:=|:|：|is|是)\s*([^\n,;，；]+)",
+            "hue": r"(?:hue|grouped\s*color|group\s*color|color|colour|分组颜色|颜色|色彩)\s*(?:=|:|：|is|是)\s*([^\n,;，；]+)",
+            "value": r"(?:value|数值|值)\s*(?:=|:|：|is|是)\s*([^\n,;，；]+)",
+        }
+        for field_name, pattern in patterns.items():
+            match = re.search(pattern, request_slice, flags=re.IGNORECASE)
+            if match:
+                if field_name == "kind":
+                    detected_kind = self._detect_requested_kind(match.group(1))
+                    if detected_kind is not None:
+                        constraints["kind"] = detected_kind
+                    continue
+                resolved = self._resolve_column_name(match.group(1), df)
+                if resolved is not None:
+                    constraints[field_name] = resolved
+        orientation_match = re.search(
+            r"(?:orientation|方向)\s*(?:=|:|：)\s*(horizontal|vertical|横向|纵向|水平)",
+            request_slice,
+            flags=re.IGNORECASE,
+        )
+        if orientation_match:
+            orientation_value = orientation_match.group(1).lower()
+            if orientation_value in {"horizontal", "横向", "水平"}:
+                constraints["orientation"] = "horizontal"
+            elif orientation_value in {"vertical", "纵向"}:
+                constraints["orientation"] = "vertical"
+        elif self._looks_like_horizontal_bar_request(request_slice):
+            constraints["orientation"] = "horizontal"
+        lowered = _clean(request_slice)
+        percent_stacked_pattern = (
+            r"(100%\s*stack(?:ed)?|percent(?:age)?\s*stack(?:ed)?|100%\s*堆叠|100\s*％\s*堆叠|百分比\s*堆叠)"
+        )
+        plain_stacked_pattern = r"(stacked|堆叠)"
+        negated_percent_pattern = (
+            r"((不是|非|not|don't|do not)\s*(100%\s*stack(?:ed)?|percent(?:age)?\s*stack(?:ed)?|100%\s*堆叠|100\s*％\s*堆叠|百分比\s*堆叠))"
+        )
+        has_percent_stacked = re.search(percent_stacked_pattern, lowered, flags=re.IGNORECASE) is not None
+        has_negated_percent_stacked = re.search(negated_percent_pattern, lowered, flags=re.IGNORECASE) is not None
+        lowered_without_negated_percent = re.sub(negated_percent_pattern, "", lowered, flags=re.IGNORECASE)
+        has_plain_stacked = re.search(plain_stacked_pattern, lowered_without_negated_percent, flags=re.IGNORECASE) is not None
+
+        if has_percent_stacked and not has_negated_percent_stacked:
+            constraints["stack_mode"] = "percent_stacked"
+            constraints["normalize_mode"] = "percent_of_group"
+        elif has_plain_stacked:
+            constraints["stack_mode"] = "stacked"
+            constraints["normalize_mode"] = "none"
+        category_order = self._extract_category_order(request_slice, df)
+        if category_order:
+            constraints["category_order"] = category_order
+        if self._looks_like_value_label_request(request_slice):
+            constraints["show_value_labels"] = True
+        return constraints
+
+    @staticmethod
+    def _looks_like_value_label_request(request: str) -> bool:
+        lowered = _clean(_instruction_request_slice(request))
+        markers = (
+            "每个柱子上显示人数",
+            "每个柱子显示人数",
+            "柱子上显示人数",
+            "柱上显示人数",
+            "显示柱子人数",
+            "显示柱子数值",
+            "显示数值标签",
+            "value labels",
+            "bar labels",
+            "show value labels",
+            "show labels on bars",
+            "annotate bars",
+            "bar annotations",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _is_explicit_chart_request(self, request: str, df: pd.DataFrame) -> bool:
+        constraints = self._extract_explicit_field_constraints(request, df)
+        if "kind" in constraints:
+            return True
+        return any(
+            field in constraints
+            for field in ("x", "y", "hue", "value", "orientation", "stack_mode", "normalize_mode", "category_order")
+        )
+
+    def _build_chart_plan(
+        self,
+        request: str,
+        df: pd.DataFrame,
+        profile: dict[str, list[str]],
+        *,
+        dataframe_role: str | None = None,
+        source_result_id: str | None = None,
+    ) -> tuple[ChartPlan | None, ChartPlanningError | None]:
+        available_columns = [str(column) for column in df.columns]
+        planned, planning_error = plan_chart_request(
+            user_request=_instruction_request_slice(request),
+            available_columns=available_columns,
+            column_types=self._column_types(df),
+            dataframe_role=dataframe_role or "plot_ready",
+            sample_values=self._planner_sample_values(df),
+            llm_call=self._call_chart_planner,
+            source_result_id=source_result_id,
+        )
+        return planned, planning_error
+
+    def _validate_chart_plan(self, request: str, df: pd.DataFrame, plan: ChartPlan) -> list[str]:
+        errors: list[str] = []
+        profile = self._profile(df)
+        explicit_fields = self._extract_explicit_field_constraints(request, df)
+        explicit_kind = explicit_fields.get("kind")
+        lowered_request = _clean(_instruction_request_slice(request))
+        numeric_columns = set(profile["numeric"])
+        categorical_columns = set(profile["categorical"] + profile["boolean"])
+        allowed_contract_kinds = {"barplot", "lineplot", "scatterplot", "boxplot", "histplot", "countplot"}
+
+        if plan.kind not in allowed_contract_kinds:
+            errors.append(f"Invalid chart kind: {plan.kind}")
+        if explicit_kind is not None and plan.kind != explicit_kind:
+            errors.append(f"User explicitly requested {explicit_kind}, but plan chose {plan.kind}.")
+
+        referenced = [value for value in [plan.x, plan.y, plan.hue, plan.value, *plan.variables] if value is not None]
+        missing = [column for column in referenced if column not in df.columns]
+        if missing:
+            errors.append(f"Referenced columns do not exist: {', '.join(sorted(set(missing)))}")
+
+        if explicit_fields:
+            for field_name, expected_column in explicit_fields.items():
+                if field_name in {"kind", "show_value_labels"}:
+                    continue
+                actual_column = getattr(plan, field_name)
+                if actual_column is None:
+                    errors.append(f"User explicitly requested {field_name}={expected_column}, but plan omitted it.")
+                elif actual_column != expected_column:
+                    errors.append(
+                        f"User explicitly requested {field_name}={expected_column}, but plan used {actual_column}."
+                    )
+
+        if "hue" in explicit_fields and not plan.hue:
+            errors.append(f"User explicitly requested hue={explicit_fields['hue']}, but plan omitted it.")
+        if explicit_kind == "barplot" and "hue" in explicit_fields and not plan.hue:
+            errors.append("Grouped bar chart contract requires hue, but plan omitted hue.")
+        if self._looks_like_grouped_hue_request(request) and "hue" in explicit_fields and not plan.hue:
+            errors.append("Request explicitly asked for grouped/color-by bars, but plan omitted hue.")
+        if plan.kind == "barplot" and plan.hue is not None and plan.hue not in categorical_columns:
+            errors.append("barplot hue should be categorical.")
+
+        def _ensure_numeric(column_name: str | None, *, label: str) -> None:
+            if column_name is None:
+                return
+            if column_name not in numeric_columns:
+                errors.append(f"{label} must be numeric, but {column_name} is not numeric.")
+
+        def _ensure_low_cardinality(column_name: str | None, *, label: str) -> None:
+            if column_name is None or column_name not in df.columns:
+                return
+            series = df[column_name]
+            if pd.api.types.is_numeric_dtype(series) and series.nunique(dropna=True) > max(8, len(df) // 5 or 1):
+                errors.append(f"{label} should be categorical or low-cardinality, but {column_name} looks high-cardinality.")
+
+        def _is_categorical_or_low_cardinality(column_name: str | None) -> bool:
+            if column_name is None or column_name not in df.columns:
+                return False
+            if column_name in categorical_columns:
+                return True
+            series = df[column_name]
+            if not pd.api.types.is_numeric_dtype(series):
+                return True
+            return bool(series.nunique(dropna=True) <= max(8, len(df) // 5 or 1))
+
+        if plan.kind == "scatterplot":
+            _ensure_numeric(plan.x, label="x")
+            _ensure_numeric(plan.y, label="y")
+        elif plan.kind == "lineplot":
+            _ensure_numeric(plan.y, label="y")
+            if plan.x is not None and plan.x in df.columns:
+                series = df[plan.x]
+                if not (
+                    pd.api.types.is_numeric_dtype(series)
+                    or _is_dt(series)
+                    or plan.x in categorical_columns
+                ):
+                    errors.append(f"x should be numeric, datetime, or categorical for lineplot, but {plan.x} is not.")
+        elif plan.kind == "barplot":
+            orientation = plan.orientation or ("horizontal" if explicit_fields.get("orientation") == "horizontal" else "vertical")
+            stack_mode = plan.stack_mode or explicit_fields.get("stack_mode") or "none"
+            value_column = plan.value or plan.y
+
+            if orientation not in {"vertical", "horizontal"}:
+                errors.append(f"barplot orientation must be vertical or horizontal, but got {orientation}.")
+
+            if stack_mode in {"stacked", "percent_stacked"}:
+                if plan.hue is None:
+                    errors.append(f"{stack_mode} barplot requires hue.")
+                if value_column is None:
+                    errors.append(f"{stack_mode} barplot requires a numeric value/y column.")
+                else:
+                    _ensure_numeric(value_column, label="value")
+                if plan.x is None:
+                    errors.append(f"{stack_mode} barplot requires x.")
+                elif not _is_categorical_or_low_cardinality(plan.x):
+                    errors.append(f"{stack_mode} barplot x should be categorical or low-cardinality.")
+                if plan.hue is not None and not _is_categorical_or_low_cardinality(plan.hue):
+                    errors.append(f"{stack_mode} barplot hue should be categorical or low-cardinality.")
+                if stack_mode == "percent_stacked":
+                    percent_marked = plan.normalize_mode in {"percent_of_group", "percent_of_total"} or any(
+                        token in lowered_request for token in ("percent", "100%", "百分比")
+                    )
+                    if not percent_marked:
+                        errors.append(
+                            "percent_stacked barplot requires explicit percentage/normalization semantics."
+                        )
+                    if plan.source_df_role not in {"aggregated", "plot_ready"}:
+                        errors.append("percent_stacked barplot requires source_df_role in {aggregated, plot_ready}.")
+                    if value_column is not None and value_column in df.columns:
+                        value_series = pd.to_numeric(df[value_column], errors="coerce").dropna()
+                        if not value_series.empty:
+                            max_value = float(value_series.max())
+                            min_value = float(value_series.min())
+                            if min_value < 0.0 or max_value > 100.0:
+                                errors.append(
+                                    "percent_stacked barplot requires percentage-like values in [0, 100]."
+                                )
+                if orientation == "horizontal" and value_column is not None and plan.y is None:
+                    errors.append("horizontal stacked barplot requires y categorical axis.")
+            else:
+                if orientation == "horizontal":
+                    if plan.x is None:
+                        errors.append("horizontal barplot requires x.")
+                    else:
+                        _ensure_numeric(plan.x, label="x")
+                    if plan.y is None:
+                        errors.append("horizontal barplot requires y.")
+                    elif not _is_categorical_or_low_cardinality(plan.y):
+                        errors.append("horizontal barplot y should be categorical or low-cardinality.")
+                else:
+                    if plan.x is None:
+                        errors.append("vertical barplot requires x.")
+                    elif not _is_categorical_or_low_cardinality(plan.x):
+                        errors.append("vertical barplot x should be categorical or low-cardinality.")
+                    if plan.y is not None:
+                        _ensure_numeric(plan.y, label="y")
+        elif plan.kind == "histplot":
+            if plan.x is None:
+                errors.append("histplot requires x.")
+            if plan.y is not None:
+                errors.append("histplot should not specify y.")
+            if plan.x is not None and plan.x in df.columns:
+                series = df[plan.x]
+                if not (
+                    pd.api.types.is_numeric_dtype(series)
+                    or _is_dt(series)
+                    or pd.api.types.is_bool_dtype(series)
+                    or pd.api.types.is_categorical_dtype(series)
+                    or pd.api.types.is_string_dtype(series)
+                ):
+                    errors.append(f"histplot x should be a single numeric/categorical column, but {plan.x} is not suitable.")
+        elif plan.kind == "countplot":
+            if plan.x is None:
+                errors.append("countplot requires x.")
+            _ensure_low_cardinality(plan.x, label="countplot x")
+        elif plan.kind == "boxplot":
+            _ensure_numeric(plan.y, label="y")
+            if plan.x is None:
+                errors.append("boxplot requires x.")
+            _ensure_low_cardinality(plan.x, label="boxplot x")
+        if plan.confidence is not None and plan.confidence not in {"high", "medium", "low"}:
+            errors.append("confidence must be one of high|medium|low when provided.")
+
+        return errors
+
+    def _normalize_chart_plan(self, request: str, df: pd.DataFrame, plan: ChartPlan) -> ChartPlan:
+        updates: dict[str, Any] = {}
+        if plan.title is None:
+            updates["title"] = self._default_chart_title(plan.kind)
+        explicit_fields = self._extract_explicit_field_constraints(request, df)
+        if explicit_fields.get("show_value_labels") and plan.show_value_labels is not True:
+            updates["show_value_labels"] = True
+        if plan.category_order == [] and explicit_fields.get("category_order"):
+            updates["category_order"] = list(explicit_fields["category_order"])
+        merged_explicit = dict(explicit_fields)
+        if plan.explicit_fields:
+            merged_explicit = {**merged_explicit, **plan.explicit_fields}
+        updates["explicit_fields"] = merged_explicit
+        if plan.planner_source is None:
+            updates["planner_source"] = "llm_json"
+        return plan.model_copy(update=updates) if updates else plan
+
+    @staticmethod
+    def _default_chart_title(kind: str) -> str:
+        return kind.replace("plot", " plot").title()
+
+    def _plan_chart(self, request: str, df: pd.DataFrame, profile: dict[str, list[str]]) -> tuple[ChartPlan | None, dict[str, Any]]:
+        debug: dict[str, Any] = {
+            "planner": "llm_json",
+            "planner_status": "planning_failed",
+            "validated": False,
+            "planner_error": None,
+            "validation_errors": [],
+            "render_error": None,
+            "raw_planner_response": None,
+            "parsed_plan": None,
+            "final_plan": None,
+            "fallback_blocked": False,
+            "fallback_reason": None,
+            "explicit_contract_kind": None,
+            "explicit_fields": None,
+            "parsed_plan_kind": None,
+            "planner_source": "llm_json",
+            "schema_error": None,
+        }
+        if self._llm_config is None:
+            debug["planner_error"] = "No llm_config available"
+            return None, debug
+        explicit_contract = self._extract_explicit_field_constraints(request, df)
+        explicit_kind = explicit_contract.get("kind")
+        debug["explicit_contract_kind"] = explicit_kind
+        debug["explicit_fields"] = dict(explicit_contract)
+
+        plan, planning_error = self._build_chart_plan(
+            request,
+            df,
+            profile,
+            dataframe_role="plot_ready",
+            source_result_id=None,
+        )
+        if planning_error is not None:
+            debug["planner_status"] = planning_error.error_code
+            debug["planner_error"] = planning_error.message
+            debug["raw_planner_response"] = planning_error.raw_response
+            debug["schema_error"] = planning_error.details
+            return None, debug
+        if plan is None:
+            debug["planner_status"] = "planning_failed"
+            debug["planner_error"] = "Planner returned no plan"
+            return None, debug
+
+        debug["parsed_plan"] = plan.model_dump(mode="json")
+        debug["parsed_plan_kind"] = plan.kind
+
+        validation_errors = self._validate_chart_plan(request, df, plan)
+        if validation_errors:
+            debug["planner_status"] = "validation_failed"
+            debug["validation_errors"] = list(validation_errors)
+            debug["planner_error"] = "chart plan failed validation"
+            return None, debug
+
+        plan = self._normalize_chart_plan(request, df, plan)
+        validation_errors = self._validate_chart_plan(request, df, plan)
+        if validation_errors:
+            debug["planner_error"] = "final plan failed validation"
+            debug["validation_errors"] = validation_errors
+            debug["planner_status"] = "validation_failed"
+            return None, debug
+
+        debug.update(
+            {
+                "planner_status": "ready",
+                "validated": True,
+                "confidence": plan.confidence,
+                "reason": plan.reason,
+                "final_plan": plan.model_dump(mode="json"),
+            }
+        )
+        return plan, debug
 
     def _profile(self, df: pd.DataFrame) -> dict[str, list[str]]:
         cols = {
@@ -195,14 +794,20 @@ class SeabornChatVisualizer(Visualizer):
     def _render(self, kind: str, df: pd.DataFrame, columns: dict[str, Any]) -> Any:
         if sns is not None:
             sns.set_theme(style="whitegrid")
+        self._apply_cjk_font_defaults()
         fig: Figure | None = None
         ax: Axes | None = None
         x, y, hue = columns["x"], columns["y"], columns["hue"]
+        value = columns.get("value")
         variables = [str(column) for column in columns.get("variables", []) if column in df.columns]
-        if kind == "histogram":
+        title = str(columns.get("title") or self._default_chart_title(kind))
+        show_value_labels = bool(columns.get("show_value_labels"))
+        if kind in {"histogram", "histplot"}:
             fig, ax = plt.subplots(figsize=(8, 4.5))
             if x is None:
-                raise ValueError("No suitable column found for histogram")
+                raise ValueError("No suitable column found for histplot")
+            if pd.api.types.is_bool_dtype(df[x]):
+                raise ValueError("histplot does not support boolean x columns without explicit conversion")
             if sns is not None:
                 sns.histplot(data=df, x=x, bins=min(30, max(5, len(df) // 10 or 10)), kde=False, ax=ax)
             else:
@@ -217,21 +822,127 @@ class SeabornChatVisualizer(Visualizer):
             else:
                 df[x].astype("string").value_counts(dropna=False).plot(kind="bar", ax=ax, color="#4C72B0")
             ax.set_ylabel("count")
+            if show_value_labels:
+                self._annotate_bar_labels(ax)
         elif kind == "barplot":
             fig, ax = plt.subplots(figsize=(8, 4.5))
-            if x is None:
-                raise ValueError("No suitable column found for barplot")
-            if y is None:
-                if sns is not None:
-                    sns.countplot(data=df, x=x, hue=hue if hue and hue != x else None, ax=ax)
+            orientation = str(columns.get("orientation") or "vertical").lower()
+            stack_mode = str(columns.get("stack_mode") or "none").lower()
+            category_order = [str(item) for item in (columns.get("category_order") or [])]
+            if orientation not in {"vertical", "horizontal"}:
+                orientation = "vertical"
+            if stack_mode in {"stacked", "percent_stacked"}:
+                value_column = str(value or y or "")
+                if not x or not hue or not value_column:
+                    raise ValueError(f"{stack_mode} barplot requires x, hue, and value/y columns")
+                if value_column not in df.columns:
+                    raise ValueError(f"{stack_mode} barplot value column {value_column} not found")
+                plot_cols = [x, hue, value_column]
+                data = df[plot_cols].dropna()
+                if category_order:
+                    data[x] = pd.Categorical(data[x], categories=category_order, ordered=True)
+                pivot = data.pivot_table(index=x, columns=hue, values=value_column, aggfunc="sum", fill_value=0)
+                if category_order:
+                    pivot = pivot.reindex(category_order)
+                pivot = pivot.fillna(0)
+                palette = sns.color_palette(n_colors=len(pivot.columns)) if sns is not None else None
+                cumulative = pd.Series(0.0, index=pivot.index)
+                for idx, hue_value in enumerate(pivot.columns):
+                    segment = pivot[hue_value].astype(float)
+                    color = palette[idx] if palette is not None else None
+                    if orientation == "horizontal":
+                        bars = ax.barh(pivot.index.astype(str), segment, left=cumulative, label=str(hue_value), color=color)
+                    else:
+                        bars = ax.bar(pivot.index.astype(str), segment, bottom=cumulative, label=str(hue_value), color=color)
+                    if show_value_labels and stack_mode == "percent_stacked":
+                        for bar in bars:
+                            label_value = bar.get_width() if orientation == "horizontal" else bar.get_height()
+                            if float(label_value) <= 0:
+                                continue
+                            if orientation == "horizontal":
+                                text_x = bar.get_x() + bar.get_width() / 2
+                                text_y = bar.get_y() + bar.get_height() / 2
+                            else:
+                                text_x = bar.get_x() + bar.get_width() / 2
+                                text_y = bar.get_y() + bar.get_height() / 2
+                            ax.text(text_x, text_y, f"{float(label_value):g}%", ha="center", va="center", fontsize=8, color="white")
+                    cumulative = cumulative + segment
+                ax.legend(title=str(hue))
+                columns["hue_used"] = True
+                columns["stack_mode_used"] = stack_mode
+                if show_value_labels and stack_mode == "percent_stacked":
+                    columns["value_labels_rendered"] = True
+                    columns["annotation_mode"] = "percent_stacked_segment_labels"
+                elif show_value_labels:
+                    self._annotate_bar_labels(ax, orientation=orientation)
+                    columns["value_labels_rendered"] = True
+                    columns["annotation_mode"] = "stacked_top_labels"
                 else:
-                    df[x].astype("string").value_counts(dropna=False).plot(kind="bar", ax=ax, color="#4C72B0")
+                    columns["value_labels_rendered"] = False
+                    columns["annotation_mode"] = None
             else:
-                data = df[[x, y]].dropna()
-                if sns is not None:
-                    sns.barplot(data=data, x=x, y=y, ax=ax, errorbar=None)
+                if x is None and orientation == "vertical":
+                    raise ValueError("No suitable column found for barplot")
+                if y is None:
+                    category_col = y if orientation == "horizontal" else x
+                    if category_col is None:
+                        raise ValueError("count-style barplot requires a categorical axis")
+                    if sns is not None:
+                        if orientation == "horizontal":
+                            sns.countplot(data=df, y=category_col, hue=hue if hue and hue != category_col else None, ax=ax)
+                        else:
+                            sns.countplot(data=df, x=category_col, hue=hue if hue and hue != category_col else None, ax=ax)
+                    else:
+                        kind_name = "barh" if orientation == "horizontal" else "bar"
+                        df[category_col].astype("string").value_counts(dropna=False).plot(kind=kind_name, ax=ax, color="#4C72B0")
                 else:
-                    data.groupby(x, dropna=False)[y].mean().plot(kind="bar", ax=ax, color="#55A868")
+                    if orientation == "horizontal":
+                        if x is None:
+                            raise ValueError("horizontal barplot requires numeric x")
+                        if y is None:
+                            raise ValueError("horizontal barplot requires categorical y")
+                        plot_columns = [x, y]
+                        if hue and hue not in {x, y} and hue in df.columns:
+                            plot_columns.append(hue)
+                        data = df[plot_columns].dropna()
+                        if category_order:
+                            data[y] = pd.Categorical(data[y], categories=category_order, ordered=True)
+                        if sns is not None:
+                            sns.barplot(data=data, x=x, y=y, hue=hue if hue and hue not in {x, y} else None, ax=ax, errorbar=None)
+                        else:
+                            group_keys = [y] + ([hue] if hue and hue not in {x, y} and hue in data.columns else [])
+                            grouped = data.groupby(group_keys, dropna=False)[x].mean()
+                            grouped.unstack(hue).plot(kind="barh", ax=ax) if len(group_keys) == 2 else grouped.plot(kind="barh", ax=ax)
+                    else:
+                        data = df[[x, y]].dropna()
+                        if hue and hue not in {x, y} and hue in df.columns:
+                            data = df[[x, y, hue]].dropna()
+                        if category_order and x is not None:
+                            data[x] = pd.Categorical(data[x], categories=category_order, ordered=True)
+                        if sns is not None:
+                            sns.barplot(data=data, x=x, y=y, hue=hue if hue and hue not in {x, y} else None, ax=ax, errorbar=None)
+                        else:
+                            if hue and hue not in {x, y} and hue in data.columns:
+                                grouped = data.groupby([x, hue], dropna=False)[y].mean().unstack(hue)
+                                grouped.plot(kind="bar", ax=ax)
+                            else:
+                                data.groupby(x, dropna=False)[y].mean().plot(kind="bar", ax=ax, color="#55A868")
+                columns["hue_used"] = bool(hue and hue not in {x, y} and hue in df.columns)
+                if show_value_labels:
+                    self._annotate_bar_labels(ax, orientation=orientation)
+                    columns["value_labels_rendered"] = True
+                    columns["annotation_mode"] = "bar_labels"
+                else:
+                    columns["value_labels_rendered"] = False
+                    columns["annotation_mode"] = None
+            chart_debug = dict(columns.get("chart_debug") or {})
+            chart_debug["orientation"] = orientation
+            chart_debug["stack_mode"] = stack_mode
+            chart_debug["hue_used"] = columns["hue_used"]
+            chart_debug["value_labels_rendered"] = columns["value_labels_rendered"]
+            chart_debug["annotation_mode"] = columns["annotation_mode"]
+            chart_debug["show_value_labels"] = bool(columns.get("show_value_labels"))
+            columns["chart_debug"] = chart_debug
         elif kind == "lineplot":
             fig, ax = plt.subplots(figsize=(8, 4.5))
             if x is None:
@@ -251,7 +962,8 @@ class SeabornChatVisualizer(Visualizer):
                     else:
                         ax.plot(data["_index"], data[x], marker="o")
             else:
-                data = df[[x, y]].dropna()
+                data_columns = [x, y] + ([hue] if hue and hue not in {x, y} else [])
+                data = df[data_columns].dropna()
                 if _is_dt(data[x]):
                     data = data.assign(**{x: pd.to_datetime(data[x], errors="coerce")}).dropna().sort_values(x)
                 else:
@@ -344,27 +1056,144 @@ class SeabornChatVisualizer(Visualizer):
             fig.tight_layout()
             return fig
         elif kind == "heatmap":
-            if len(variables) < 2:
-                raise ValueError("Need at least two numeric columns for heatmap")
             fig, ax = plt.subplots(figsize=(8, 6))
-            corr = df[variables].corr(numeric_only=True)
-            if sns is not None:
-                sns.heatmap(corr, cmap="viridis", annot=len(variables) <= 8, ax=ax)
+            mode = str(columns.get("mode") or "correlation").lower()
+            if mode == "pivot":
+                if x is None or y is None or columns.get("value") is None:
+                    raise ValueError("Need x, y, and value for pivot heatmap")
+                value = str(columns["value"])
+                pivot = df.pivot_table(index=y, columns=x, values=value, aggfunc="mean")
+                if sns is not None:
+                    sns.heatmap(pivot, cmap="viridis", annot=len(pivot.columns) <= 8, ax=ax)
+                else:
+                    im = ax.imshow(pivot.values, cmap="viridis")
+                    ax.set_xticks(range(len(pivot.columns)))
+                    ax.set_yticks(range(len(pivot.index)))
+                    ax.set_xticklabels(list(map(str, pivot.columns)), rotation=45, ha="right")
+                    ax.set_yticklabels(list(map(str, pivot.index)))
+                    fig.colorbar(im, ax=ax)
             else:
-                im = ax.imshow(corr.values, cmap="viridis")
-                ax.set_xticks(range(len(corr.columns)))
-                ax.set_yticks(range(len(corr.index)))
-                ax.set_xticklabels(list(corr.columns), rotation=45, ha="right")
-                ax.set_yticklabels(list(corr.index))
-                fig.colorbar(im, ax=ax)
+                if len(variables) < 2:
+                    raise ValueError("Need at least two numeric columns for heatmap")
+                corr = df[variables].corr(numeric_only=True)
+                if sns is not None:
+                    sns.heatmap(corr, cmap="viridis", annot=len(variables) <= 8, ax=ax)
+                else:
+                    im = ax.imshow(corr.values, cmap="viridis")
+                    ax.set_xticks(range(len(corr.columns)))
+                    ax.set_yticks(range(len(corr.index)))
+                    ax.set_xticklabels(list(corr.columns), rotation=45, ha="right")
+                    ax.set_yticklabels(list(corr.index))
+                    fig.colorbar(im, ax=ax)
         else:
             raise ValueError("No suitable chart kind could be inferred")
         if ax is not None:
-            ax.set_title(kind.replace("plot", " plot").title())
+            self._apply_axis_labels(
+                ax,
+                kind,
+                x,
+                y,
+                orientation=str(columns.get("orientation") or "vertical"),
+                stack_mode=str(columns.get("stack_mode") or "none"),
+                value=str(columns.get("value")) if columns.get("value") is not None else None,
+            )
+            ax.set_title(title)
+        elif fig is not None:
+            fig.suptitle(title)
         fig.tight_layout()
         return fig
 
+    @staticmethod
+    def _annotate_bar_labels(ax: Axes, *, orientation: str = "vertical") -> None:
+        for container in getattr(ax, "containers", []):
+            for patch in getattr(container, "patches", container):
+                try:
+                    value = float(patch.get_width() if orientation == "horizontal" else patch.get_height())
+                except Exception:
+                    continue
+                if value is None:
+                    continue
+                if orientation == "horizontal":
+                    x = patch.get_x() + patch.get_width()
+                    y = patch.get_y() + patch.get_height() / 2
+                    offset_xy = (3 if value >= 0 else -3, 0)
+                    ha = "left" if value >= 0 else "right"
+                    va = "center"
+                else:
+                    x = patch.get_x() + patch.get_width() / 2
+                    y = value
+                    offset_xy = (0, 3 if value >= 0 else -3)
+                    ha = "center"
+                    va = "bottom" if value >= 0 else "top"
+                ax.annotate(
+                    f"{value:g}",
+                    xy=(x, y),
+                    xytext=offset_xy,
+                    textcoords="offset points",
+                    ha=ha,
+                    va=va,
+                    fontsize=9,
+                    clip_on=False,
+                )
+
+    @staticmethod
+    def _apply_cjk_font_defaults() -> None:
+        try:
+            from matplotlib import font_manager
+        except Exception:
+            return
+        available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+        for candidate in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "PingFang SC", "WenQuanYi Zen Hei"):
+            if candidate in available_fonts:
+                matplotlib.rcParams["font.family"] = "sans-serif"
+                sans_serif = list(matplotlib.rcParams.get("font.sans-serif", []))
+                if candidate not in sans_serif:
+                    matplotlib.rcParams["font.sans-serif"] = [candidate, *sans_serif]
+                break
+        matplotlib.rcParams["axes.unicode_minus"] = False
+
+    @staticmethod
+    def _apply_axis_labels(
+        ax: Axes,
+        kind: str,
+        x: str | None,
+        y: str | None,
+        *,
+        orientation: str = "vertical",
+        stack_mode: str = "none",
+        value: str | None = None,
+    ) -> None:
+        if kind in {"barplot", "countplot"}:
+            if kind == "barplot" and orientation == "horizontal":
+                ax.set_xlabel(str(x) if x is not None else (str(value) if value else "value"))
+                ax.set_ylabel(str(y) if y is not None else "category")
+                return
+            if kind == "barplot" and stack_mode in {"stacked", "percent_stacked"}:
+                ax.set_xlabel(str(x) if x is not None else "category")
+                if stack_mode == "percent_stacked":
+                    ax.set_ylabel("percent")
+                else:
+                    ax.set_ylabel(str(value or y or "value"))
+                return
+            if x is not None:
+                ax.set_xlabel(str(x))
+            if y is not None:
+                ax.set_ylabel(str(y))
+            elif kind == "countplot":
+                ax.set_ylabel("count")
+            return
+        if kind in {"histogram", "histplot"}:
+            if x is not None:
+                ax.set_xlabel(str(x))
+            ax.set_ylabel("count")
+            return
+        if x is not None:
+            ax.set_xlabel(str(x))
+        if y is not None:
+            ax.set_ylabel(str(y))
+
     def _result(self, request: str, df: pd.DataFrame | None, kind: str | None, text: str, plot: Any | None, columns: dict[str, Any]) -> SeabornChatResult:
+        chart_debug = dict(columns.get("chart_debug") or {})
         meta = {
             VisualisationResult.META_PLOT_MESSAGES_KEY: [] if df is None else [
                 {"backend": "seaborn", "request": request, "kind": kind, "columns": columns}
@@ -372,6 +1201,24 @@ class SeabornChatVisualizer(Visualizer):
             "plot_backend": "seaborn",
             "plot_kind": kind,
             "plot_config": columns,
+            "planner": columns.get("planner"),
+            "validated": columns.get("validated"),
+            "repair_used": columns.get("repair_used"),
+            "confidence": columns.get("confidence"),
+            "reason": columns.get("reason"),
+            "fallback_reason": columns.get("fallback_reason"),
+            "fallback_blocked": columns.get("fallback_blocked"),
+            "planner_status": columns.get("planner_status"),
+            "planner_error": columns.get("planner_error"),
+            "validation_errors": columns.get("validation_errors"),
+            "render_error": columns.get("render_error"),
+            "show_value_labels": columns.get("show_value_labels"),
+            "planner_source": columns.get("planner_source"),
+            "orientation": columns.get("orientation"),
+            "stack_mode": columns.get("stack_mode"),
+            "normalize_mode": columns.get("normalize_mode"),
+            "chart_debug": chart_debug,
+            "plot_error": columns.get("plot_error"),
         }
         return SeabornChatResult(
             text=text,
@@ -386,18 +1233,238 @@ class SeabornChatVisualizer(Visualizer):
 
     def _visualize(self, request: str, data: ExecutionResult, *, stream: bool = False) -> SeabornChatResult:
         if data.df is None or data.df.empty:
-            return self._result(request, data.df, None, "Nothing to visualize", None, {"x": None, "y": None, "hue": None})
+            return self._result(
+                request,
+                data.df,
+                None,
+                "Nothing to visualize",
+                None,
+                {
+                    "x": None,
+                    "y": None,
+                    "hue": None,
+                    "orientation": None,
+                    "stack_mode": None,
+                    "normalize_mode": None,
+                    "category_order": [],
+                    "explicit_fields": {},
+                    "planner_source": "fallback",
+                    "planner": "fallback",
+                    "validated": False,
+                    "planner_status": "no_data",
+                    "chart_debug": {"planner": "fallback", "planner_status": "no_data", "validated": False},
+                },
+            )
         profile = self._profile(data.df)
+        explicit_fields = self._extract_explicit_field_constraints(request, data.df)
+        plan, plan_debug = self._plan_chart(request, data.df, profile)
+        if plan is not None and plan_debug.get("validated"):
+            final_validation_errors = self._validate_chart_plan(request, data.df, plan)
+            if final_validation_errors:
+                plan_debug["planner_status"] = "validation_failed"
+                plan_debug["validated"] = False
+                plan_debug["validation_errors"] = final_validation_errors
+                plan = None
+            else:
+                columns = {
+                    "x": plan.x,
+                    "y": plan.y,
+                    "hue": plan.hue,
+                    "variables": list(plan.variables),
+                    "value": plan.value,
+                    "mode": plan.mode,
+                    "orientation": plan.orientation,
+                    "stack_mode": plan.stack_mode,
+                    "normalize_mode": plan.normalize_mode,
+                    "category_order": list(plan.category_order),
+                    "explicit_fields": dict(plan.explicit_fields),
+                    "planner_source": plan.planner_source or "llm_json",
+                    "title": plan.title,
+                    "show_value_labels": bool(plan.show_value_labels or explicit_fields.get("show_value_labels")),
+                    "planner": "llm_json",
+                    "validated": True,
+                    "confidence": plan.confidence,
+                    "reason": plan.reason,
+                    "fallback_reason": None,
+                    "fallback_blocked": False,
+                    "planner_status": str(plan_debug.get("planner_status") or "ready"),
+                    "planner_error": plan_debug.get("planner_error"),
+                    "validation_errors": list(plan_debug.get("validation_errors") or []),
+                    "render_error": None,
+                    "chart_debug": dict(plan_debug),
+                    "plot_error": None,
+                }
+                try:
+                    fig = self._render(plan.kind, data.df, columns)
+                except Exception as exc:
+                    plan_debug["planner_status"] = "render_failed"
+                    plan_debug["validated"] = False
+                    plan_debug["render_error"] = str(exc)
+                    plan_debug["fallback_blocked"] = True
+                    logger.warning("LLM-planned chart failed to render: %s", exc)
+                    return self._result(
+                        request,
+                        data.df,
+                        plan.kind,
+                        f"Failed to render requested {plan.kind} chart: {exc}",
+                        None,
+                        {
+                            **columns,
+                            "validated": False,
+                            "planner_status": "render_failed",
+                            "render_error": str(exc),
+                            "chart_debug": dict(plan_debug),
+                            "fallback_reason": None,
+                            "fallback_blocked": True,
+                            "plot_error": str(exc),
+                        },
+                    )
+                else:
+                    return self._result(request, data.df, plan.kind, f"Rendered {plan.kind} chart via LLM-planned spec.", fig, columns)
+        planner_status = str(plan_debug.get("planner_status") or "planning_failed")
+        fallback_allowed_status = {"planning_failed", "schema_parse_failed", "validation_failed"}
+        explicit_percent_stacked = explicit_fields.get("stack_mode") == "percent_stacked"
+        if (
+            planner_status in fallback_allowed_status
+            and explicit_percent_stacked
+            and not self._allow_semantic_fallback_for_explicit_requests
+        ):
+            failure_text = (
+                plan_debug.get("planner_error")
+                or "; ".join(str(item) for item in (plan_debug.get("validation_errors") or []))
+                or "Failed to generate explicit percent-stacked chart."
+            )
+            plan_debug["fallback_blocked"] = True
+            return self._result(
+                request,
+                data.df,
+                plan.kind if plan is not None else "barplot",
+                failure_text,
+                None,
+                {
+                    "x": plan.x if plan is not None else explicit_fields.get("x"),
+                    "y": plan.y if plan is not None else explicit_fields.get("y"),
+                    "hue": plan.hue if plan is not None else explicit_fields.get("hue"),
+                    "variables": list(plan.variables) if plan is not None else [],
+                    "value": plan.value if plan is not None else explicit_fields.get("value"),
+                    "mode": plan.mode if plan is not None else None,
+                    "orientation": plan.orientation if plan is not None else explicit_fields.get("orientation"),
+                    "stack_mode": "percent_stacked",
+                    "normalize_mode": "percent_of_group",
+                    "category_order": list(plan.category_order) if plan is not None else list(explicit_fields.get("category_order") or []),
+                    "explicit_fields": dict(plan.explicit_fields) if plan is not None else dict(explicit_fields),
+                    "planner_source": (plan.planner_source if plan is not None else "llm_json") or "llm_json",
+                    "title": plan.title if plan is not None else None,
+                    "show_value_labels": bool((plan.show_value_labels if plan is not None else False) or explicit_fields.get("show_value_labels")),
+                    "planner": "llm_json",
+                    "validated": False,
+                    "confidence": plan_debug.get("confidence"),
+                    "reason": plan_debug.get("reason"),
+                    "fallback_reason": None,
+                    "fallback_blocked": True,
+                    "planner_status": planner_status,
+                    "planner_error": plan_debug.get("planner_error"),
+                    "validation_errors": list(plan_debug.get("validation_errors") or []),
+                    "render_error": plan_debug.get("render_error"),
+                    "chart_debug": dict(plan_debug),
+                    "plot_error": failure_text,
+                },
+            )
+        if planner_status not in fallback_allowed_status:
+            failure_text = (
+                plan_debug.get("render_error")
+                or plan_debug.get("planner_error")
+                or "; ".join(str(item) for item in (plan_debug.get("validation_errors") or []))
+                or "Failed to generate requested chart."
+            )
+            plan_debug["fallback_blocked"] = True
+            failed_kind = plan.kind if plan is not None else None
+            return self._result(
+                request,
+                data.df,
+                failed_kind,
+                failure_text,
+                None,
+                {
+                    "x": plan.x if plan is not None else None,
+                    "y": plan.y if plan is not None else None,
+                    "hue": plan.hue if plan is not None else None,
+                    "variables": list(plan.variables) if plan is not None else [],
+                    "value": plan.value if plan is not None else None,
+                    "mode": plan.mode if plan is not None else None,
+                    "orientation": plan.orientation if plan is not None else None,
+                    "stack_mode": plan.stack_mode if plan is not None else None,
+                    "normalize_mode": plan.normalize_mode if plan is not None else None,
+                    "category_order": list(plan.category_order) if plan is not None else [],
+                    "explicit_fields": dict(plan.explicit_fields) if plan is not None else dict(explicit_fields),
+                    "planner_source": (plan.planner_source if plan is not None else "llm_json") or "llm_json",
+                    "title": plan.title if plan is not None else None,
+                    "show_value_labels": bool((plan.show_value_labels if plan is not None else False) or explicit_fields.get("show_value_labels")),
+                    "planner": "llm_json",
+                    "validated": False,
+                    "confidence": plan_debug.get("confidence"),
+                    "reason": plan_debug.get("reason"),
+                    "fallback_reason": None,
+                    "fallback_blocked": True,
+                    "planner_status": planner_status,
+                    "planner_error": plan_debug.get("planner_error"),
+                    "validation_errors": list(plan_debug.get("validation_errors") or []),
+                    "render_error": plan_debug.get("render_error"),
+                    "chart_debug": dict(plan_debug),
+                    "plot_error": failure_text,
+                },
+            )
+
+        fallback_reason = plan_debug.get("planner_error") or "LLM planning unavailable"
+        if plan is None or not plan_debug.get("validated"):
+            logger.warning("Falling back to legacy seaborn heuristics: %s", fallback_reason)
         kind = self._choose_kind(request, profile)
         columns = self._pick_columns(kind, profile)
+        columns.update(
+            {
+                "planner": "fallback",
+                "validated": False,
+                "fallback_reason": fallback_reason,
+                "fallback_blocked": False,
+                "confidence": None,
+                "reason": None,
+                "title": self._default_chart_title(kind) if kind is not None else None,
+                "show_value_labels": bool(explicit_fields.get("show_value_labels")),
+                "orientation": "vertical" if kind == "barplot" else None,
+                "stack_mode": "none" if kind == "barplot" else None,
+                "normalize_mode": "none",
+                "category_order": list(explicit_fields.get("category_order") or []),
+                "explicit_fields": dict(explicit_fields),
+                "planner_source": "fallback",
+                "planner_status": "fallback",
+                "planner_error": plan_debug.get("planner_error"),
+                "validation_errors": list(plan_debug.get("validation_errors") or []),
+                "render_error": None,
+                "chart_debug": {
+                    **dict(plan_debug),
+                    "planner": "fallback",
+                    "planner_status": "fallback",
+                    "fallback_reason": fallback_reason,
+                    "fallback_blocked": False,
+                },
+                "plot_error": None,
+            }
+        )
         if kind is None:
             return self._result(request, data.df, None, "Failed to infer a chart kind for the provided dataframe.", None, columns)
         try:
             fig = self._render(kind, data.df, columns)
         except Exception as exc:
             logger.warning("Failed to render seaborn chart: %s", exc)
+            columns["render_error"] = str(exc)
+            columns["plot_error"] = str(exc)
+            chart_debug = dict(columns.get("chart_debug") or {})
+            chart_debug["render_error"] = str(exc)
+            chart_debug["planner_status"] = "render_failed"
+            chart_debug["show_value_labels"] = bool(columns.get("show_value_labels"))
+            columns["chart_debug"] = chart_debug
             return self._result(request, data.df, kind, f"Failed to visualize request! Output: {exc}", None, columns)
-        return self._result(request, data.df, kind, f"Rendered {kind} chart.", fig, columns)
+        return self._result(request, data.df, kind, f"Rendered {kind} chart via fallback.", fig, columns)
 
     def edit(self, request: str, visualization: VisualisationResult, *, stream: bool = False) -> SeabornChatResult:
         if not isinstance(visualization, SeabornChatResult):
@@ -407,3 +1474,5 @@ class SeabornChatVisualizer(Visualizer):
         if visualization.meta.get(VisualisationResult.META_PLOT_MESSAGES_KEY) is None:
             raise ValueError("No plot message history found in the provided visualization")
         return self._visualize(request, ExecutionResult(text=visualization.text, meta={}, df=visualization.dataframe), stream=stream)
+
+
