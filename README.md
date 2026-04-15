@@ -8,9 +8,9 @@ This workspace fuses:
 
 The default runtime path is `.runtime/context_domain`.
 The default runtime provider is now DeepSeek's official API with `deepseek-chat`, and Ollama remains available as a fallback.
-The current default analysis chain is:
+The current primary analysis chain is:
 
-`Streamlit UI -> ChatService -> DatabaoRuntime -> databao.agent(...).thread().ask(...) -> text / df / plot / meta`
+`ui/app.py -> bootstrap.py -> ChatService -> DatabaoRuntime -> databao.agent(...).thread().ask(...) -> text / df / plot / meta`
 
 ## Run
 
@@ -41,7 +41,6 @@ The current default analysis chain is:
 - The repository should be run from an installed Python environment. The checked-in code no longer depends on `.vendor` to resolve imports.
 - `Launch Full Stack Data Agent.cmd` now assumes dependencies are installed into the selected interpreter, rather than injecting `.vendor` into `PYTHONPATH`.
 - The launcher will auto-install missing Python dependencies with `python -m pip install -e .` unless `FSDA_AUTO_INSTALL=0` is set.
-- Legacy host-side chat facade modules still exist for reference, but the default analysis path is Databao-backed.
 - To switch back to pure local mode, set `LLM_PROVIDER=ollama` and keep `LLM_FALLBACK_PROVIDER=ollama`.
 - The UI header and sidebar show the active provider, active model, and fallback provider for the current session.
 
@@ -54,10 +53,12 @@ The current default analysis chain is:
 - Plot spec/debug metadata when a visualization path is used
 - Error details if DeepSeek, Ollama fallback, Databao runtime, or model availability fails
 
-## Legacy Modules
+## Legacy Host Path Archive
 
-These modules are still present but are no longer the default runtime path:
+Legacy host-side modules were removed from the active package path and archived under:
 
-- `full_stack_data_agent/agent/chat_agent.py`
-- `full_stack_data_agent/context/context_packet_builder.py`
-- `full_stack_data_agent/llm/ollama_provider.py`
+- `archived/legacy_host_path/agent/`
+- `archived/legacy_host_path/llm/`
+- `archived/legacy_host_path/context/`
+
+The active runtime path should stay on the Databao-backed chain above.

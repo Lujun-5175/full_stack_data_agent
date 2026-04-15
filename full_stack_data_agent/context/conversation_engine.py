@@ -32,6 +32,60 @@ class ConversationEngine:
         )
         return state
 
+    def begin_assistant_message(
+        self,
+        state: ConversationState,
+        *,
+        content: str = "",
+        metadata: dict | None = None,
+    ) -> ConversationState:
+        if not state.turns:
+            raise ValueError("Cannot add an assistant message before a user message.")
+        last_turn = state.turns[-1]
+        state.turns[-1] = replace(
+            last_turn,
+            assistant_message=ConversationMessage(role="assistant", content=content, status="streaming"),
+            metadata=metadata or {},
+        )
+        return state
+
+    def update_assistant_message(
+        self,
+        state: ConversationState,
+        content: str,
+        *,
+        metadata: dict | None = None,
+    ) -> ConversationState:
+        if not state.turns or state.turns[-1].assistant_message is None:
+            raise ValueError("Cannot update an assistant message before it exists.")
+        last_turn = state.turns[-1]
+        assistant_message = last_turn.assistant_message
+        state.turns[-1] = replace(
+            last_turn,
+            assistant_message=replace(assistant_message, content=content, status="streaming"),
+            metadata=metadata if metadata is not None else last_turn.metadata,
+        )
+        return state
+
+    def finalize_assistant_message(
+        self,
+        state: ConversationState,
+        content: str,
+        *,
+        metadata: dict | None = None,
+        status: str = "complete",
+    ) -> ConversationState:
+        if not state.turns or state.turns[-1].assistant_message is None:
+            raise ValueError("Cannot finalize an assistant message before it exists.")
+        last_turn = state.turns[-1]
+        assistant_message = last_turn.assistant_message
+        state.turns[-1] = replace(
+            last_turn,
+            assistant_message=replace(assistant_message, content=content, status=status),
+            metadata=metadata if metadata is not None else last_turn.metadata,
+        )
+        return state
+
     def recent_messages(self, state: ConversationState) -> list[ConversationMessage]:
         recent_turns = state.turns[-self._turn_window :]
         messages: list[ConversationMessage] = []

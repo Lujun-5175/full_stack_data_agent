@@ -194,7 +194,7 @@ class SeparateGraph:
             Args:
                 query_id: The ID of the query to submit (query_ids are automatically generated when you run queries).
                 result_description: A comment to a final result. This will be included in the final result.
-                visualization_prompt: Optional visualization prompt. If not empty, a Vega-Lite visualization agent
+                visualization_prompt: Optional visualization prompt. If not empty, the chart visualizer
                     will be asked to plot the submitted query data according to instructions in the prompt.
                     The instructions should be short and simple.
             """

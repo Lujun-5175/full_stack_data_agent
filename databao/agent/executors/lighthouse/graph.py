@@ -3,7 +3,7 @@ from typing import Annotated, Any, Literal
 
 import pandas as pd
 from duckdb import DuckDBPyConnection
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.constants import END, START
 from langgraph.graph import add_messages
@@ -16,7 +16,8 @@ from databao.agent.configs.agent import AgentConfig
 from databao.agent.configs.llm import LLMConfig
 from databao.agent.core import Domain, ExecutionResult
 from databao.agent.executors.langchain_tools import make_search_context_tool
-from databao.agent.executors.llm import chat, model_bind_tools
+from databao.agent.executors.llm import call_model_with_retry, chat, model_bind_tools
+from databao.agent.sql.guardrail import SqlGuardrail
 from databao.agent.executors.utils import exception_to_string
 from databao.agent.executors.utils import run_sql_query as _run_sql_query
 
@@ -36,6 +37,14 @@ class AgentState(TypedDict):
     visualization_prompt: str | None
     ready_for_user: bool
     limit_max_rows: int | None
+    guardrail_failures: int
+    guardrail_stop_reason: str | None
+    query_obligations: dict[str, Any] | None
+    sql_retry_history: list[dict[str, Any]]
+    parsed_sql_summary: dict[str, Any] | None
+    execution_validation_report: dict[str, Any] | None
+    final_guardrail_status: str | None
+    repair_attempts: list[dict[str, Any]]
 
 
 def get_query_ids_mapping(messages: list[BaseMessage]) -> dict[str, ToolMessage]:
@@ -58,6 +67,28 @@ class ExecuteSubmit:
 
     def __init__(self, connection: DuckDBPyConnection):
         self._connection = connection
+        self._guardrail = SqlGuardrail(max_retries=3, llm_call=None)
+
+    def _make_query_frame_llm_call(self, model_config: LLMConfig) -> Any:
+        model = model_config.new_chat_model()
+
+        def _call(prompt: str) -> str:
+            messages = [
+                SystemMessage(
+                    content=(
+                        "You produce strict JSON semantic query frames for SQL grounding. "
+                        "Return JSON only and never guess final schema bindings."
+                    )
+                ),
+                HumanMessage(content=str(prompt)),
+            ]
+            response = call_model_with_retry(model, messages)
+            raw_text = getattr(response, "content", response)
+            if isinstance(raw_text, list):
+                raw_text = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in raw_text)
+            return str(raw_text)
+
+        return _call
 
     def init_state(self, messages: list[BaseMessage], *, limit_max_rows: int | None = None) -> AgentState:
         return AgentState(
@@ -68,9 +99,37 @@ class ExecuteSubmit:
             visualization_prompt=None,
             ready_for_user=False,
             limit_max_rows=limit_max_rows,
+            guardrail_failures=0,
+            guardrail_stop_reason=None,
+            query_obligations=None,
+            sql_retry_history=[],
+            parsed_sql_summary=None,
+            execution_validation_report=None,
+            final_guardrail_status=None,
+            repair_attempts=[],
         )
 
     def get_result(self, state: AgentState) -> ExecutionResult:
+        stop_reason = state.get("guardrail_stop_reason")
+        if stop_reason:
+            return ExecutionResult(
+                text=stop_reason,
+                df=state.get("df"),
+                code=state.get("sql", ""),
+                meta={
+                    "visualization_prompt": state.get("visualization_prompt"),
+                    ExecutionResult.META_MESSAGES_KEY: state["messages"],
+                    "submit_called": False,
+                    "guardrail_stop_reason": stop_reason,
+                    "query_obligations": state.get("query_obligations"),
+                    "sql_retry_history": state.get("sql_retry_history", []),
+                    "parsed_sql_summary": state.get("parsed_sql_summary"),
+                    "execution_validation_report": state.get("execution_validation_report"),
+                    "final_guardrail_status": state.get("final_guardrail_status"),
+                    "repair_attempts": state.get("repair_attempts", []),
+                },
+            )
+
         last_ai_message = None
         for m in reversed(state["messages"]):
             if isinstance(m, AIMessage):
@@ -91,6 +150,12 @@ class ExecuteSubmit:
                     "visualization_prompt": visualization_prompt,
                     ExecutionResult.META_MESSAGES_KEY: state["messages"],
                     "submit_called": False,
+                    "query_obligations": state.get("query_obligations"),
+                    "sql_retry_history": state.get("sql_retry_history", []),
+                    "parsed_sql_summary": state.get("parsed_sql_summary"),
+                    "execution_validation_report": state.get("execution_validation_report"),
+                    "final_guardrail_status": state.get("final_guardrail_status"),
+                    "repair_attempts": state.get("repair_attempts", []),
                 },
             )
         elif len(last_ai_message.tool_calls) > 1:
@@ -113,6 +178,12 @@ class ExecuteSubmit:
                     "visualization_prompt": visualization_prompt,
                     ExecutionResult.META_MESSAGES_KEY: state["messages"],
                     "submit_called": True,
+                    "query_obligations": state.get("query_obligations"),
+                    "sql_retry_history": state.get("sql_retry_history", []),
+                    "parsed_sql_summary": state.get("parsed_sql_summary"),
+                    "execution_validation_report": state.get("execution_validation_report"),
+                    "final_guardrail_status": state.get("final_guardrail_status"),
+                    "repair_attempts": state.get("repair_attempts", []),
                 },
             )
         return result
@@ -123,6 +194,21 @@ class ExecuteSubmit:
     def make_tools(self, domain: Domain, extra_tools: list[BaseTool] | None = None) -> list[BaseTool]:
         @tool(description=RUN_SQL_QUERY_TOOL_DESCRIPTION)
         def run_sql_query(sql: str, graph_state: Annotated[AgentState, InjectedState]) -> dict[str, Any]:
+            query = self._guardrail.latest_user_query(graph_state.get("messages", []))
+            schema = self._guardrail.schema_from_connection(self._connection)
+            report = self._guardrail.validate_before_execution(query=query, sql=sql, schema=schema)
+            if report.blocked:
+                payload = self._guardrail.to_retry_error_payload(
+                    report,
+                    attempt=int(graph_state.get("guardrail_failures", 0)) + 1,
+                    max_attempts=self._guardrail.max_retries,
+                )
+                return {
+                    "error": self._guardrail.to_retry_error_text(payload),
+                    "error_type": "sql_guardrail",
+                    "guardrail": payload,
+                    "sql": sql,
+                }
             return _run_sql_query(
                 sql,
                 con=self._connection,
@@ -145,7 +231,7 @@ class ExecuteSubmit:
             Args:
                 query_id: The ID of the query to submit (query_ids are automatically generated when you run queries).
                 result_description: A comment to a final result. This will be included in the final result.
-                visualization_prompt: Optional visualization prompt. If not empty, a Vega-Lite visualization agent
+                visualization_prompt: Optional visualization prompt. If not empty, the chart visualizer
                     will be asked to plot the submitted query data according to instructions in the prompt.
                     The instructions should be short and simple.
             """
@@ -168,6 +254,7 @@ class ExecuteSubmit:
         domain: Domain,
         extra_tools: list[BaseTool] | None = None,
     ) -> CompiledStateGraph[Any]:
+        self._guardrail = SqlGuardrail(max_retries=3, llm_call=self._make_query_frame_llm_call(model_config))
         tools = self.make_tools(domain, extra_tools=extra_tools)
         llm_model = model_config.new_chat_model()
 
@@ -228,6 +315,14 @@ class ExecuteSubmit:
             sql = state.get("sql")
             df = state.get("df")
             visualization_prompt = state.get("visualization_prompt", "")
+            guardrail_failures = int(state.get("guardrail_failures", 0))
+            guardrail_stop_reason = state.get("guardrail_stop_reason")
+            query_obligations = state.get("query_obligations")
+            sql_retry_history = list(state.get("sql_retry_history", []))
+            parsed_sql_summary = state.get("parsed_sql_summary")
+            execution_validation_report = state.get("execution_validation_report")
+            final_guardrail_status = state.get("final_guardrail_status")
+            repair_attempts = list(state.get("repair_attempts", []))
 
             message_index = len(state["messages"]) - 1
 
@@ -250,6 +345,29 @@ class ExecuteSubmit:
                 if name == "run_sql_query":
                     sql = result.get("sql")
                     df = result.get("df")
+                    if result.get("error_type") == "sql_guardrail":
+                        guard_payload = dict(result.get("guardrail") or {})
+                        guard_report = dict(guard_payload.get("report") or {})
+                        if query_obligations is None:
+                            query_obligations = guard_report.get("obligations")
+                        parsed_sql_summary = guard_report.get("parsed_sql_summary") or parsed_sql_summary
+                        execution_validation_report = guard_report.get("execution_validation_report") or execution_validation_report
+                        final_guardrail_status = guard_report.get("final_guardrail_status") or (guard_report.get("guardrail_report") or {}).get("status") or final_guardrail_status
+                        sql_retry_history.append(
+                            {
+                                "attempt": guard_payload.get("attempt"),
+                                "max_attempts": guard_payload.get("max_attempts"),
+                                "report": guard_report,
+                            }
+                        )
+                        repair_attempts = list(guard_report.get("repair_attempts") or repair_attempts)
+                        guardrail_failures += 1
+                        if guardrail_failures >= self._guardrail.max_retries:
+                            guardrail_stop_reason = (
+                                "SQL guardrail blocked query generation after "
+                                f"{self._guardrail.max_retries} attempts. "
+                                "Please revise the SQL constraints or prompt."
+                            )
                     # Generate query_id using message index and tool call index
                     query_id = f"{message_index}-{idx}"
                     # Override the query_id in the result
@@ -264,11 +382,53 @@ class ExecuteSubmit:
                             artifact=result,
                         )
                 elif name == "submit_result":
-                    content = str(result)
                     query_id = tool_call["args"]["query_id"]
                     visualization_prompt = tool_call["args"].get("visualization_prompt", "")
                     sql = state["query_ids"][query_id].artifact["sql"]
                     df = state["query_ids"][query_id].artifact["df"]
+                    query = self._guardrail.latest_user_query(state.get("messages", []))
+                    schema = self._guardrail.schema_from_connection(self._connection)
+                    post_report = self._guardrail.validate_after_execution(
+                        query=query,
+                        sql=sql,
+                        dataframe=df,
+                        schema=schema,
+                    )
+                    if post_report.blocked:
+                        guardrail_failures += 1
+                        payload = self._guardrail.to_retry_error_payload(
+                            post_report,
+                            attempt=guardrail_failures,
+                            max_attempts=self._guardrail.max_retries,
+                        )
+                        if query_obligations is None:
+                            query_obligations = (payload.get("report") or {}).get("obligations")
+                        parsed_sql_summary = post_report.parsed_sql_summary or parsed_sql_summary
+                        execution_validation_report = post_report.execution_validation_report or execution_validation_report
+                        final_guardrail_status = post_report.final_guardrail_status or final_guardrail_status
+                        sql_retry_history.append(
+                            {
+                                "attempt": payload.get("attempt"),
+                                "max_attempts": payload.get("max_attempts"),
+                                "report": payload.get("report"),
+                            }
+                        )
+                        repair_attempts = list(post_report.repair_attempts or repair_attempts)
+                        result = {
+                            "error": self._guardrail.to_retry_error_text(payload),
+                            "error_type": "sql_guardrail",
+                            "guardrail": payload,
+                            "sql": sql,
+                        }
+                        content = result["error"]
+                        if guardrail_failures >= self._guardrail.max_retries:
+                            guardrail_stop_reason = (
+                                "SQL guardrail blocked submit_result after "
+                                f"{self._guardrail.max_retries} attempts. "
+                                "Please revise the SQL constraints or prompt."
+                            )
+                    else:
+                        content = str(result)
                 else:
                     if isinstance(result, dict):
                         content = json.dumps(result, ensure_ascii=False, default=str)
@@ -276,12 +436,37 @@ class ExecuteSubmit:
                         content = str(result)
                 tool_messages.append(ToolMessage(content=content, tool_call_id=tool_call_id, artifact=result))
                 if name == "submit_result":
+                    if isinstance(result, dict) and result.get("error_type") == "sql_guardrail":
+                        return {
+                            "messages": tool_messages,
+                            "query_ids": query_ids,
+                            "sql": sql,
+                            "df": df,
+                            "visualization_prompt": visualization_prompt,
+                            "ready_for_user": bool(guardrail_stop_reason),
+                            "guardrail_failures": guardrail_failures,
+                            "guardrail_stop_reason": guardrail_stop_reason,
+                            "query_obligations": query_obligations,
+                            "sql_retry_history": sql_retry_history,
+                            "parsed_sql_summary": parsed_sql_summary,
+                            "execution_validation_report": execution_validation_report,
+                            "final_guardrail_status": final_guardrail_status,
+                            "repair_attempts": repair_attempts,
+                        }
                     return {
                         "messages": tool_messages,
                         "sql": sql,
                         "df": df,
                         "visualization_prompt": visualization_prompt,
                         "ready_for_user": True,
+                        "guardrail_failures": guardrail_failures,
+                        "guardrail_stop_reason": guardrail_stop_reason,
+                        "query_obligations": query_obligations,
+                        "sql_retry_history": sql_retry_history,
+                        "parsed_sql_summary": parsed_sql_summary,
+                        "execution_validation_report": execution_validation_report,
+                        "final_guardrail_status": final_guardrail_status,
+                        "repair_attempts": repair_attempts,
                     }
             return {
                 "messages": tool_messages,
@@ -290,6 +475,14 @@ class ExecuteSubmit:
                 "df": df,
                 "visualization_prompt": visualization_prompt,
                 "ready_for_user": False,
+                "guardrail_failures": guardrail_failures,
+                "guardrail_stop_reason": guardrail_stop_reason,
+                "query_obligations": query_obligations,
+                "sql_retry_history": sql_retry_history,
+                "parsed_sql_summary": parsed_sql_summary,
+                "execution_validation_report": execution_validation_report,
+                "final_guardrail_status": final_guardrail_status,
+                "repair_attempts": repair_attempts,
             }
 
         def should_continue(state: AgentState) -> Literal["tool_executor", "end"]:

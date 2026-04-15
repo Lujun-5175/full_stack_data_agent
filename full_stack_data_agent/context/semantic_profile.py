@@ -7,33 +7,16 @@ from typing import Any
 
 import pandas as pd
 
-
-_BOOLEAN_TOKENS = {
-    "true": True,
-    "false": False,
-    "yes": True,
-    "no": False,
-    "y": True,
-    "n": False,
-    "t": True,
-    "f": False,
-    "1": True,
-    "0": False,
-    "on": True,
-    "off": False,
-}
+from full_stack_data_agent.utils.text_classification import (
+    BOOLEAN_TOKEN_MAP,
+    DATETIME_HINT_RE,
+    NUMERIC_RE,
+    series_fullmatch,
+)
 
 
 _COLUMN_ALIAS_RE = re.compile(r"[^a-z0-9]+")
-_NUMERIC_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$")
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
-_DATETIME_HINT_RE = re.compile(
-    r"(?ix)"
-    r"(^\d{4}[-/]\d{1,2}[-/]\d{1,2}([ t]\d{1,2}:\d{2}(:\d{2})?)?$)"
-    r"|(^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$)"
-    r"|(^[a-z]{3,9}\s+\d{1,2},?\s+\d{4}$)"
-    r"|(^\d{4}-\d{2}$)"
-)
 
 
 @dataclass(frozen=True)
@@ -137,16 +120,16 @@ def _profile_column(series: pd.Series) -> ColumnSemanticHint:
         return ColumnSemanticHint(semantic_type="empty", confidence=1.0, reasons=["column only contains whitespace"])
 
     lower = text.str.lower()
-    boolean_matches = lower.isin(_BOOLEAN_TOKENS.keys())
+    boolean_matches = lower.isin(BOOLEAN_TOKEN_MAP.keys())
     boolean_ratio = float(boolean_matches.mean()) if len(boolean_matches) else 0.0
 
-    datetime_like = _series_fullmatch(text, _DATETIME_HINT_RE)
+    datetime_like = series_fullmatch(text, DATETIME_HINT_RE)
     datetime_like_ratio = float(datetime_like.mean()) if len(datetime_like) else 0.0
 
-    numeric_like = _series_fullmatch(text, _NUMERIC_RE)
+    numeric_like = series_fullmatch(text, NUMERIC_RE)
     numeric_like_ratio = float(numeric_like.mean()) if len(numeric_like) else 0.0
 
-    integer_like = _series_fullmatch(text, _INTEGER_RE)
+    integer_like = series_fullmatch(text, _INTEGER_RE)
     integer_like_ratio = float(integer_like.mean()) if len(integer_like) else 0.0
 
     unique_count = int(text.nunique(dropna=True))
@@ -192,7 +175,7 @@ def _canonical_boolean_map(series: pd.Series) -> dict[str, str]:
     values = [item for item in text.tolist() if item]
     mapping: dict[str, str] = {}
     for item in sorted(set(values)):
-        canonical = _BOOLEAN_TOKENS.get(item)
+        canonical = BOOLEAN_TOKEN_MAP.get(item)
         if canonical is None:
             continue
         mapping[item] = "true" if canonical else "false"
@@ -218,8 +201,3 @@ def _canonical_categorical_map(series: pd.Series) -> dict[str, str]:
         for observed_value in observed:
             mapping[observed_value] = canonical_value
     return mapping
-
-
-def _series_fullmatch(series: pd.Series, pattern: re.Pattern[str]) -> pd.Series:
-    values = series.astype("string")
-    return values.map(lambda value: bool(pattern.fullmatch(str(value))) if not pd.isna(value) else False)

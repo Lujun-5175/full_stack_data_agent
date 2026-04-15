@@ -1,5 +1,5 @@
 import re
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 import pandas as pd
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, BaseMessageChunk, ToolMessage
@@ -15,17 +15,27 @@ class TextStreamFrontend:
         start_state: dict[str, Any],
         *,
         writer: TextIO | None = None,
+        on_text_chunk: Callable[[str], None] | None = None,
         escape_markdown: bool = False,
         show_headers: bool = True,
         pretty_sql: bool = True,
     ):
         self._writer = writer  # Use io.Writer type in Python 3.14
+        self._on_text_chunk = on_text_chunk
         self._escape_markdown = escape_markdown
         self._show_headers = show_headers
         self._message_count = len(start_state.get("messages", []))
         self._started = False
         self._is_tool_calling = False
         self._pretty_sql = pretty_sql
+
+    def _emit_text_chunk(self, text: str) -> None:
+        if self._on_text_chunk is None or not text:
+            return
+        try:
+            self._on_text_chunk(text)
+        except Exception:
+            pass
 
     def write(self, text: str) -> None:
         if not self._started:
@@ -43,6 +53,7 @@ class TextStreamFrontend:
         text = reasoning_text + message.text
         if self._escape_markdown:
             text = escape_markdown_text(text)
+        self._emit_text_chunk(text)
         self.write(text)
 
         if tool_calls := message.tool_calls:
@@ -63,6 +74,7 @@ class TextStreamFrontend:
         text = reasoning_text + chunk.text
         if self._escape_markdown:
             text = escape_markdown_text(text)
+        self._emit_text_chunk(text)
         self.write(text)
 
         if len(chunk.tool_call_chunks) > 0:

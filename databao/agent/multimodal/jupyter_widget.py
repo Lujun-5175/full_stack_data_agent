@@ -17,7 +17,6 @@ except ImportError as e:
     ) from e
 
 from databao.agent.multimodal.utils import dataframe_to_csv
-from databao.agent.visualizers.vega_chat import VegaChatResult
 
 if TYPE_CHECKING:
     from databao.agent.core.thread import Thread
@@ -89,17 +88,13 @@ class MultimodalWidget(anywidget.AnyWidget):
             self.spec_status = "loading"
             plot = self.thread.plot()
 
-            if not isinstance(plot, VegaChatResult):
+            png_bytes = getattr(plot, "png_bytes", None)
+            if not callable(png_bytes) or not png_bytes():
                 self.spec_status = "failed"
                 raise ValueError("Failed to generate visualization")
-
-            if plot.spec is None or plot.spec_df is None:
-                self.spec_status = "failed"
-                raise ValueError("Failed to generate visualization")
-
-            self.spec_csv_data = dataframe_to_csv(plot.spec_df)
-            self.spec_status = "loaded"
-            self.spec = plot.spec
+            self.spec_csv_data = dataframe_to_csv(self.thread.df())
+            self.spec_status = "failed"
+            raise ValueError("Jupyter widget chart tab no longer supports spec-only chart payloads.")
 
         elif payload == "DATAFRAME":
             if self.dataframe_csv_content_status != "initial":

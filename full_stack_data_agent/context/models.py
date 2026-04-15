@@ -10,7 +10,9 @@ from uuid import uuid4
 class ConversationMessage:
     role: Literal["user", "assistant", "system"]
     content: str
+    message_id: str = field(default_factory=lambda: str(uuid4()))
     created_at: float = field(default_factory=time)
+    status: Literal["complete", "streaming", "error"] = "complete"
 
 
 @dataclass
@@ -30,6 +32,7 @@ class UploadedFileContext:
     summary: str
     snippets: list[str] = field(default_factory=list)
     extracted_text: str = ""
+    tabular_payload: str | None = None
     is_tabular: bool = False
     table_name: str | None = None
     row_count: int | None = None

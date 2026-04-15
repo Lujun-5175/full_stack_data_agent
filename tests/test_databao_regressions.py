@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
-import altair as alt
+import matplotlib
 import pandas as pd
+matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt
 from langchain_core.messages import HumanMessage
 
 from full_stack_data_agent.app.chat_service import ChatService
@@ -21,29 +24,39 @@ from full_stack_data_agent.ui.components import _registered_table_lookup
 class _FakePlotResult:
     def __init__(self, dataframe: pd.DataFrame):
         self.code = '{"mark":"bar"}'
-        self.meta = {"kind": "bar"}
-        self.spec = {
-            "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-            "mark": "bar",
-            "encoding": {
-                "x": {"field": "grade", "type": "nominal"},
-                "y": {"aggregate": "count", "type": "quantitative"},
-            },
-        }
-        self.spec_df = dataframe
+        self.meta = {"kind": "bar", "data_rows": len(dataframe)}
+        figure, axis = plt.subplots()
+        axis.bar(dataframe.iloc[:, 0].astype(str), dataframe.iloc[:, 1].astype(float))
+        self.plot = figure
 
 
-class _PlotObjectWithChartMethod:
-    def __init__(self, chart: alt.Chart) -> None:
-        self._chart = chart
+class _PlotObjectWithPngBytes:
+    def png_bytes(self) -> bytes:
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2eY1cAAAAASUVORK5CYII="
+        )
 
-    def to_altair_chart(self) -> alt.Chart:
-        return self._chart
+
+class _PlotObjectWithMatplotlibFigure:
+    def __init__(self) -> None:
+        figure, axis = plt.subplots()
+        axis.plot([1, 2, 3], [1, 4, 9])
+        self.plot = figure
 
 
-class _PlotObjectWithPlotAttribute:
-    def __init__(self, chart: alt.Chart) -> None:
-        self.plot = chart
+class _FakeImagePlotResult:
+    def __init__(self) -> None:
+        self.backend = "seaborn"
+        self.kind = "histogram"
+        self.meta = {"kind": "histogram"}
+
+    def png_bytes(self) -> bytes:
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2eY1cAAAAASUVORK5CYII="
+        )
+
+    def png_base64(self) -> str:
+        return base64.b64encode(self.png_bytes()).decode("utf-8")
 
 
 class _FakeThread:
@@ -243,18 +256,43 @@ def test_chart_request_collects_chart_artifact() -> None:
     )
 
     assert thread.plot_calls == ["study_hours_per_day distribution chart, split into four charts by grade"]
-    assert result.plot_spec is not None
-    assert result.plot_data is not None
     assert result.plot_code == '{"mark":"bar"}'
     assert result.plot_error is None
     assert result.chart_debug["chart_requested"] is True
     assert result.chart_debug["chart_generation_called"] is True
     assert result.chart_debug["chart_generated"] is True
     assert result.chart_debug["chart_renderable"] is True
-    assert result.chart_debug["plot_spec_present"] is True
-    assert result.chart_debug["plot_data_rows"] == len(result.plot_data)
     assert result.chart_debug["chart_saved_to_history"] is True
     assert result.chart_debug["chart_artifact_id"]
+    assert result.primary_chart_artifact_id == f"chart:{result.chart_debug['chart_artifact_id']}"
+    assert result.thread_meta["grounded_response"]["primary_chart_artifact_id"] == result.primary_chart_artifact_id
+    chart_artifact = result.result_workspace.resolve_artifact(result.primary_chart_artifact_id)
+    assert chart_artifact is not None
+    assert chart_artifact.render_payload["render_kind"] == "matplotlib_figure"
+
+
+def test_chart_request_collects_image_artifact_for_seaborn_backend() -> None:
+    dataframe = _load_student_data()
+    thread = _FakeThread(
+        dataframe,
+        initial_text="chart ready",
+        plot_factory=lambda _request: _FakeImagePlotResult(),
+    )
+    runtime = _make_runtime(thread)
+
+    result, _snapshot = runtime.ask(
+        "session-1",
+        "show a histogram of overall_score",
+        uploaded_contexts=[],
+    )
+
+    assert result.plot_backend == "seaborn"
+    assert result.plot_kind == "histogram"
+    assert result.plot_image_base64 is not None
+    assert result.plot_image_mime_type == "image/png"
+    assert result.chart_debug["plot_image_present"] is True
+    assert result.chart_debug["chart_renderable"] is True
+    assert result.plot_image_base64.startswith("iVBOR")
 
 
 def test_single_filtered_chart_preserves_filter_and_render_payload() -> None:
@@ -275,89 +313,19 @@ def test_single_filtered_chart_preserves_filter_and_render_payload() -> None:
     )
 
     assert thread.plot_calls == ["Please plot the overall_score distribution for students where grade is C."]
-    assert result.plot_data is not None
-    assert {row["grade"] for row in result.plot_data} == {"C"}
-    assert all("overall_score" in row for row in result.plot_data)
+    chart_artifact = result.result_workspace.resolve_artifact(result.primary_chart_artifact_id)
+    assert chart_artifact is not None
+    assert chart_artifact.parent_artifact_id == result.primary_table_artifact_id
 
 
-def test_result_panel_renders_plot_object_via_to_altair_chart(monkeypatch) -> None:
+def test_result_panel_renders_plot_object_via_png_bytes(monkeypatch) -> None:
     calls: dict[str, object] = {}
 
     monkeypatch.setattr("streamlit.markdown", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.error", lambda *args, **kwargs: calls.setdefault("error", args[0] if args else ""))
-    monkeypatch.setattr("streamlit.altair_chart", lambda chart, **kwargs: calls.setdefault("chart", chart))
-
-    class _DummyExpander:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr("streamlit.expander", lambda *args, **kwargs: _DummyExpander())
-
-    chart = alt.Chart(pd.DataFrame([{"grade": "C", "overall_score": 72.5}])).mark_bar()
-    response = DatabaoTurnResult(
-        text="chart answer",
-        dataframe_preview=[{"grade": "C", "overall_score": 72.5}],
-        columns=["grade", "overall_score"],
-        row_count=1,
-        plot_code='{"mark":"bar"}',
-        plot_object=_PlotObjectWithChartMethod(chart),
-    )
-
-    render_result_panel(SimpleNamespace(last_databao_result=response))
-
-    assert calls["chart"].to_dict()["mark"]["type"] == "bar"
-    assert calls["chart"].to_dict()["height"] == 360
-    assert "error" not in calls
-
-
-def test_result_panel_renders_plot_object_via_plot_attribute(monkeypatch) -> None:
-    calls: dict[str, object] = {}
-
-    monkeypatch.setattr("streamlit.markdown", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.error", lambda *args, **kwargs: calls.setdefault("error", args[0] if args else ""))
-    monkeypatch.setattr("streamlit.altair_chart", lambda chart, **kwargs: calls.setdefault("chart", chart))
-
-    class _DummyExpander:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr("streamlit.expander", lambda *args, **kwargs: _DummyExpander())
-
-    chart = alt.Chart(pd.DataFrame([{"grade": "C", "overall_score": 72.5}])).mark_bar()
-    response = DatabaoTurnResult(
-        text="chart answer",
-        dataframe_preview=[{"grade": "C", "overall_score": 72.5}],
-        columns=["grade", "overall_score"],
-        row_count=1,
-        plot_code='{"mark":"bar"}',
-        plot_object=_PlotObjectWithPlotAttribute(chart),
-    )
-
-    render_result_panel(SimpleNamespace(last_databao_result=response))
-
-    assert calls["chart"].to_dict()["mark"]["type"] == "bar"
-    assert calls["chart"].to_dict()["height"] == 360
-    assert "error" not in calls
-
-
-def test_result_panel_falls_back_to_plot_spec_and_data(monkeypatch) -> None:
-    calls: dict[str, object] = {}
-
-    monkeypatch.setattr("streamlit.markdown", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.error", lambda *args, **kwargs: calls.setdefault("error", args[0] if args else ""))
-    monkeypatch.setattr("streamlit.altair_chart", lambda chart, **kwargs: calls.setdefault("chart", chart))
+    monkeypatch.setattr("streamlit.image", lambda chart, **kwargs: calls.setdefault("chart", chart))
 
     class _DummyExpander:
         def __enter__(self):
@@ -374,21 +342,80 @@ def test_result_panel_falls_back_to_plot_spec_and_data(monkeypatch) -> None:
         columns=["grade", "overall_score"],
         row_count=1,
         plot_code='{"mark":"bar"}',
-        plot_spec={
-            "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-            "mark": "bar",
-            "encoding": {
-                "x": {"field": "grade", "type": "nominal"},
-                "y": {"field": "overall_score", "type": "quantitative"},
-            },
-        },
-        plot_data=[{"grade": "C", "overall_score": 72.5}],
+        plot_object=_PlotObjectWithPngBytes(),
     )
 
     render_result_panel(SimpleNamespace(last_databao_result=response))
 
     assert "chart" in calls
-    assert calls["chart"].to_dict()["height"] == 360
+    assert "error" not in calls
+
+
+def test_result_panel_renders_matplotlib_figure_via_plot_attribute(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr("streamlit.markdown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.error", lambda *args, **kwargs: calls.setdefault("error", args[0] if args else ""))
+    monkeypatch.setattr("streamlit.pyplot", lambda chart, **kwargs: calls.setdefault("chart", chart))
+
+    class _DummyExpander:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("streamlit.expander", lambda *args, **kwargs: _DummyExpander())
+
+    response = DatabaoTurnResult(
+        text="chart answer",
+        dataframe_preview=[{"grade": "C", "overall_score": 72.5}],
+        columns=["grade", "overall_score"],
+        row_count=1,
+        plot_code='{"mark":"bar"}',
+        plot_object=_PlotObjectWithMatplotlibFigure(),
+    )
+
+    render_result_panel(SimpleNamespace(last_databao_result=response))
+
+    assert "chart" in calls
+    assert "error" not in calls
+
+
+def test_result_panel_renders_plot_image_base64_history_payload(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr("streamlit.markdown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.error", lambda *args, **kwargs: calls.setdefault("error", args[0] if args else ""))
+    monkeypatch.setattr("streamlit.image", lambda image, **kwargs: calls.setdefault("image", image))
+
+    class _DummyExpander:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("streamlit.expander", lambda *args, **kwargs: _DummyExpander())
+
+    response = DatabaoTurnResult(
+        text="chart answer",
+        dataframe_preview=[{"grade": "C", "overall_score": 72.5}],
+        columns=["grade", "overall_score"],
+        row_count=1,
+        plot_backend="seaborn",
+        plot_kind="histogram",
+        plot_image_base64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2eY1cAAAAASUVORK5CYII=",
+        plot_image_mime_type="image/png",
+    )
+
+    render_result_panel(SimpleNamespace(last_databao_result=response))
+
+    assert "image" in calls
     assert "error" not in calls
 
 
@@ -397,7 +424,7 @@ def test_result_panel_returns_false_when_fallback_payload_is_incomplete(monkeypa
     monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.error", lambda *args, **kwargs: None)
-    monkeypatch.setattr("streamlit.altair_chart", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.image", lambda *args, **kwargs: None)
 
     class _DummyExpander:
         def __enter__(self):
@@ -425,7 +452,7 @@ def test_result_panel_surfaces_renderer_failure(monkeypatch) -> None:
     monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.error", lambda message, **kwargs: errors.append(str(message)))
-    monkeypatch.setattr("streamlit.altair_chart", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.pyplot", lambda *args, **kwargs: None)
 
     class _DummyExpander:
         def __enter__(self):
@@ -442,7 +469,7 @@ def test_result_panel_surfaces_renderer_failure(monkeypatch) -> None:
             "BrokenPlotObject",
             (),
             {
-                "to_altair_chart": lambda self: (_ for _ in ()).throw(ValueError("broken chart object")),
+                "plot": property(lambda self: (_ for _ in ()).throw(ValueError("broken chart object"))),
             },
         )(),
     )
@@ -458,7 +485,7 @@ def test_result_panel_warns_on_plot_error(monkeypatch) -> None:
     monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.warning", lambda message, **kwargs: warnings.append(str(message)))
-    monkeypatch.setattr("streamlit.altair_chart", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.image", lambda *args, **kwargs: None)
 
     class _DummyExpander:
         def __enter__(self):
@@ -490,7 +517,7 @@ def test_conversation_history_warns_on_plot_error(monkeypatch) -> None:
     monkeypatch.setattr("streamlit.dataframe", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.code", lambda *args, **kwargs: None)
     monkeypatch.setattr("streamlit.warning", lambda message, **kwargs: warnings.append(str(message)))
-    monkeypatch.setattr("streamlit.altair_chart", lambda *args, **kwargs: None)
+    monkeypatch.setattr("streamlit.image", lambda *args, **kwargs: None)
 
     class _DummyExpander:
         def __enter__(self):
@@ -514,8 +541,7 @@ def test_conversation_history_warns_on_plot_error(monkeypatch) -> None:
                         "chart_failure_reason": "broken chart payload",
                     },
                     "plot_error": "broken chart payload",
-                    "plot_spec": {"mark": "bar"},
-                    "plot_data": [{"grade": "C", "overall_score": 72.5}],
+                    "plot_image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2eY1cAAAAASUVORK5CYII=",
                 },
             )
         ],
@@ -534,8 +560,7 @@ def test_chat_service_persists_chart_debug_in_conversation_snapshot(monkeypatch)
         text="chart answer",
         row_count=1,
         plot_code='{"mark":"bar"}',
-        plot_spec={"mark": "bar"},
-        plot_data=[{"grade": "C", "overall_score": 72.5}],
+        plot_image_base64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2eY1cAAAAASUVORK5CYII=",
         chart_debug={
             "chart_requested": True,
             "chart_generated": True,
@@ -555,6 +580,51 @@ def test_chat_service_persists_chart_debug_in_conversation_snapshot(monkeypatch)
 
     assert result.conversation_snapshot["turns"][0]["metadata"]["chart_debug"]["chart_requested"] is True
     assert new_state.turns[0].debug_detailed["chart_debug"]["chart_artifact_id"] == "chart-123"
+
+
+def test_chat_service_persists_plot_image_artifacts(monkeypatch) -> None:
+    service = ChatService(get_settings())
+    state = service.create_state()
+
+    fake_result = DatabaoTurnResult(
+        text="chart answer",
+        row_count=1,
+        plot_backend="seaborn",
+        plot_kind="histogram",
+        plot_image_base64="abc123",
+        plot_image_mime_type="image/png",
+        chart_debug={"chart_requested": True, "plot_image_present": True},
+    )
+    fake_snapshot = DatabaoSessionSnapshot(
+        conversation_id=state.conversation_id,
+        llm_name="deepseek-chat",
+        executor_type="lighthouse",
+    )
+
+    monkeypatch.setattr(service._runtime, "ask", lambda *args, **kwargs: (fake_result, fake_snapshot))
+
+    new_state, result = service.send_message(state, "show chart", uploaded_contexts=[])
+
+    assert result.conversation_snapshot["turns"][0]["metadata"]["plot_backend"] == "seaborn"
+    assert result.conversation_snapshot["turns"][0]["metadata"]["plot_image_base64"] == "abc123"
+    assert new_state.turns[0].metadata["plot_kind"] == "histogram"
+
+
+def test_turn_result_to_dict_includes_plot_image_fields() -> None:
+    result = DatabaoTurnResult(
+        text="chart answer",
+        plot_backend="seaborn",
+        plot_kind="histogram",
+        plot_image_base64="abc123",
+        plot_image_mime_type="image/png",
+    )
+
+    payload = result.to_dict()
+
+    assert payload["plot_backend"] == "seaborn"
+    assert payload["plot_kind"] == "histogram"
+    assert payload["plot_image_base64"] == "abc123"
+    assert payload["plot_image_mime_type"] == "image/png"
 
 
 def test_registered_table_lookup_works_with_snapshot_object() -> None:

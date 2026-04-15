@@ -3,6 +3,7 @@ setlocal EnableExtensions
 
 set "ROOT=%~dp0"
 set "ROOT=%ROOT:~0,-1%"
+set "PORT=8501"
 
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
@@ -25,9 +26,31 @@ if not defined PYTHON_EXE (
   exit /b 1
 )
 
+set "PS_EXE="
+if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" set "PS_EXE=%ProgramFiles%\PowerShell\7\pwsh.exe"
+if not defined PS_EXE if exist "%ProgramW6432%\PowerShell\7\pwsh.exe" set "PS_EXE=%ProgramW6432%\PowerShell\7\pwsh.exe"
+if not defined PS_EXE for /f "delims=" %%I in ('where pwsh 2^>nul') do if not defined PS_EXE set "PS_EXE=%%I"
+if not defined PS_EXE set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+
 cd /d "%ROOT%"
 
+echo PowerShell: "%PS_EXE%"
 echo Using Python: "%PYTHON_EXE%"
+echo Checking for stale Full Stack Data Agent processes on port %PORT%...
+
+"%PS_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$port = %PORT%;" ^
+  "$connections = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' };" ^
+  "foreach ($connection in $connections) {" ^
+  "  $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $connection.OwningProcess) -ErrorAction SilentlyContinue;" ^
+  "  if ($null -eq $process) { continue }" ^
+  "  $commandLine = [string]$process.CommandLine;" ^
+  "  if ($commandLine -match 'launch_fsda\.py' -or $commandLine -match 'full_stack_data_agent[\\/]+ui[\\/]+app\.py' -or $commandLine -match 'streamlit\s+run') {" ^
+  "    Write-Host ('Stopping stale FSDA process ' + $process.ProcessId + ' on port ' + $port + '...');" ^
+  "    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue;" ^
+  "  }" ^
+  "}"
+
 echo Launching Full Stack Data Agent...
 echo.
 

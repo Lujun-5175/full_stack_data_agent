@@ -62,8 +62,6 @@ class SourcesManager:
         self._sources.additional_description.append(text)
 
     def finalize(self) -> None:
-        if self._sources.is_empty:
-            raise ValueError("No sources registered.")
         self._is_finalized = True
 
     @property

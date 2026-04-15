@@ -36,8 +36,8 @@ class VisualisationResult(BaseModel):
     Attributes:
         text: Short description produced alongside the plot.
         meta: Additional details from the visualizer (debug info, quality flags, etc.).
-        plot: Backend-specific plot object (Altair, matplotlib, etc.) or None if not drawable.
-        code: Optional code used to generate the plot (e.g., Vega-Lite spec JSON).
+        plot: Backend-specific plot object (matplotlib, notebook-renderable object, etc.) or None if not drawable.
+        code: Optional code or serialized chart instructions used to generate the plot.
     """
 
     META_PLOT_MESSAGES_KEY: ClassVar[Literal["plot_messages"]] = "plot_messages"
@@ -71,7 +71,7 @@ class VisualisationResult(BaseModel):
         if self.plot is None:
             return None
 
-        # Altair uses _repr_mimebundle_ as per: https://altair-viz.github.io/user_guide/custom_renderers.html
+        # Some notebook renderables expose rich MIME bundles directly.
         if hasattr(self.plot, "_repr_mimebundle_"):
             return self.plot._repr_mimebundle_(include, exclude)
 
