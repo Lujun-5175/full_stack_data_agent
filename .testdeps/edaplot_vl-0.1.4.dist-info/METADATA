@@ -1,0 +1,169 @@
+Metadata-Version: 2.4
+Name: edaplot-vl
+Version: 0.1.4
+Summary: Plot your data with natural language
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.10
+Requires-Dist: altair[all]>=5.5.0
+Requires-Dist: commentjson>=0.9.0
+Requires-Dist: langchain-anthropic>=1.0.4
+Requires-Dist: langchain-ollama>=1.0.0
+Requires-Dist: langchain-openai>=1.0.3
+Requires-Dist: langchain>=1.0.7
+Requires-Dist: langgraph>=1.0.3
+Requires-Dist: pandas>=2.2.2
+Requires-Dist: pillow>=11.1.0
+Requires-Dist: tqdm>=4.67.1
+Requires-Dist: vl-convert-python>=1.7.0
+Description-Content-Type: text/markdown
+
+# EDAplot (VegaChat)
+
+This repository contains a snapshot of the code used for the paper "Generating and Evaluating Declarative Charts Using Large Language Models".
+
+## Usage
+
+Set an OpenAI API key as an env variable and install [uv](https://docs.astral.sh/uv/) first. If you're unfamiliar with it refer to the [environment section](#configuring-dev-environment).
+
+Run the interactive Streamlit prototype locally with:
+```bash
+uv run python -m streamlit run frontend/app.py
+```
+
+To use the code as a library, look into [api.py](./edaplot/api.py).
+
+## Evaluation
+
+### Setup
+
+Download evaluation datasets:
+- [NLV Corpus](dataset/nlv_corpus/README.md) is included
+- [chart-llm](https://github.com/hyungkwonko/chart-llm) should be cloned into `./dataset/`:
+    ```bash
+    cd dataset
+    git clone https://github.com/hyungkwonko/chart-llm.git
+    cd ..
+    ```
+
+### Benchmarks
+
+Example for running the NLV Corpus benchmark:
+```bash
+uv run python -m scripts.run_benchmark nlv_corpus --dataset_dir dataset/nlv_corpus --output_path out/benchmarks
+```
+
+Run the interactive results report with:
+```bash
+uv run python -m streamlit run benchmark/reports/vega_chat_benchmark_report.py out/benchmarks
+```
+where `out` is the path to the directory containing the saved outputs.
+
+### Evals
+
+Our set of custom test cases ([_evals_](tests/resources/evals)) are defined as `yaml` files.
+Each eval specifies the _actions_ to take and the _checks_ to perform after each action.
+
+Run the evals with:
+```bash
+uv run python -m scripts.run_benchmark evals --output_path out/evals
+```
+
+Run the interactive results report with:
+```bash
+uv run python -m streamlit run benchmark/reports/evals_report.py out/evals
+```
+where `out` is the path to the directory containing the saved outputs.
+
+Update existing results with new checks using:
+```bash
+uv run python -m scripts.run_eval_checks out/evals/
+```
+
+### Request Analyzer
+
+Run the request analyzer benchmark with:
+```bash
+uv run python -m scripts.run_request_analyzer_benchmark --dataset_dir dataset/chart-llm --take_n 180 --output_path out/request_analyzer_benchmark/ chart_llm_gold
+```
+
+View the results with:
+```bash
+uv run python -m streamlit run benchmark/reports/request_analyzer_benchmark_report.py out/request_analyzer_benchmark/
+```
+
+
+### LLM as a judge
+
+#### Vision Judge
+
+The vision judge uses a multimodal LLM to compare the generated image to the reference image.
+It can be used to compare results from different plotting libraries (e.g., matplotlib and Vega-Lite).
+
+To run the vision judge evaluation on existing outputs use:
+```bash
+uv run python -m scripts.run_vision_judge example.jsonl
+```
+or use the `--vision_judge` flag together with `scripts/run_benchmark.py`
+
+##### Vision Judge Benchmark
+To evaluate the vision judge, we use a separate [benchmark](tests/resources/vision_judge_benchmark).
+
+Run it with:
+```bash
+uv run python -m scripts.run_vision_judge_benchmark
+```
+
+View the results with:
+```bash
+uv run python -m streamlit run benchmark/reports/vision_judge_benchmark_report.py out/vision_judge_benchmark/
+```
+
+#### Correlation with Human Judgments
+
+To measure the correlation between the human judgments and different metrics requires running:
+1. [vision_judge_human_eval.py](./benchmark/vision_judge_human_eval.py) to generate an evaluation dataset
+2. [human_eval_db.py](./benchmark/human_eval_db.py) to store the evaluation dataset in a Postgres database
+3. [vision_judge_human_eval_app.py](./benchmark/reports/vision_judge_human_eval_app.py) to run the interactive evaluation environment
+
+
+#### LIDA Self-Evaluation
+
+[LIDA](https://github.com/microsoft/lida)'s self-evaluation can be run with:
+```bash
+uv run python -m scripts.run_lida_self_eval example.jsonl
+```
+
+## Configuring dev environment
+
+1. [Install uv](https://docs.astral.sh/uv/)
+2. Install dependencies:
+    ```bash
+    uv sync
+    ```
+3. Enable pre-commit:
+    ```bash
+    uv run pre-commit install
+    ```
+4. Add OpenAI API key to the env variable `OPENAI_API_KEY`
+
+Run tests with:
+```bash
+uv run pytest tests -v
+uv run pytest tests -v -m "not external_data"  # To skip tests that require external data
+```
+For some tests you need to first download the [Evaluation datasets](#evaluation).
+
+### Publishing
+
+To publish a new release to PyPI:
+1. `git tag -a v0.1.2 -m v0.1.2` and `git push --tags`. This sets the package version dynamically.
+2. The [publish.yml](.github/workflows/publish.yml) workflow will trigger when a new version tag is pushed.
+
+### Docker
+
+Build the image and run the container:
+```bash
+docker build -f frontend.Dockerfile -t edaplot .
+docker run --rm -p 8501:8501 -e OPENAI_API_KEY -t edaplot
+```

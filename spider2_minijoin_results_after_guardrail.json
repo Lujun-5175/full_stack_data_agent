@@ -1,0 +1,79 @@
+{
+  "selected": [
+    "local004",
+    "local029",
+    "local058",
+    "local163",
+    "local075"
+  ],
+  "records": [
+    {
+      "instance_id": "local004",
+      "db": "E_commerce",
+      "service_error": "Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+      "has_result": false,
+      "assistant_text": null,
+      "sql_attempt_count": 0,
+      "guardrail_error_count": 0,
+      "guardrail_error_samples": [],
+      "guardrail_stop_reason": null,
+      "row_count": null,
+      "columns": null
+    },
+    {
+      "instance_id": "local029",
+      "db": "Brazilian_E_Commerce",
+      "service_error": null,
+      "has_result": true,
+      "assistant_text": "SQL guardrail blocked query generation after 3 attempts. Please revise the SQL constraints or prompt.",
+      "sql_attempt_count": 20,
+      "guardrail_error_count": 20,
+      "guardrail_error_samples": [
+        "SQL_GUARDRAIL_ERROR {\"error_type\": \"sql_guardrail\", \"attempt\": 1, \"max_attempts\": 3, \"report\": {\"blocked\": true, \"issues\": [{\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_order_items' is missing from SQL.\", \"details\": {\"required_table\": \"olist_order_items\"}}, {\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_order_payments' is missing from SQL.\", \"details\": {\"required_table\": \"olist_order_payments\"}}, {\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_order_reviews' is missing from SQL.\", \"details\": {\"required_table\": \"olist_order_reviews\"}}, {\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_orders' is missing from SQL.\", \"details\": {\"required_table\": \"olist_orders\"}}, {\"code\": \"required_filter_missing\", \"message\": \"Required filter 'delivered' is missing from SQL.\", \"details\": {\"filter\": \"delivered\"}}, {\"code\": \"aggregation_missing\", \"message\": \"Query requires aggregation but no aggregate function was detected.\", \"details\": {}}, {\"code\": \"topn_order_missing\", \"message\": \"Top-N intent detected but SQL is missing ORDER BY.\", \"details\": {}}], \"obligations\": {\"required_tables\": [], \"required_fact_tables\": [\"olist_customers\", \"olist_order_items\", \"olist_order_payments\", \"olist_order_reviews\", \"olist_orders\"], \"required_years\": [], \"required_status_values\": [\"delivered\"], \"required_metrics\": [\"average\", \"payment\"], \"requires_topn\": true, \"requires_aggregation\": true, \"requires_distinct\": false, \"requires_order_desc\": true, \"requires_join\": true}, \"query\": \"Please identify the top three customers, based on their customer_unique_id, who have the highest number of delivered orders, and provide the average payment value, city, and state for each of these customers.\", \"sql\": \"SELECT * FROM temp.main.olist_customers LIMIT 5;\", \"available_tables\": [\"olist_customers\", \"olist_geolocation\", \"olist_order_items\", \"olist_order_payments\", \"olist_order_reviews\", \"olist_orders\", \"olist_products\", \"olist_products_dataset\", \"olist_sellers\", \"product_category_name_translation\"]}}",
+        "SQL_GUARDRAIL_ERROR {\"error_type\": \"sql_guardrail\", \"attempt\": 2, \"max_attempts\": 3, \"report\": {\"blocked\": true, \"issues\": [{\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_customers' is missing from SQL.\", \"details\": {\"required_table\": \"olist_customers\"}}, {\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_order_items' is missing from SQL.\", \"details\": {\"required_table\": \"olist_order_items\"}}, {\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_order_payments' is missing from SQL.\", \"details\": {\"required_table\": \"olist_order_payments\"}}, {\"code\": \"required_table_missing\", \"message\": \"Required table 'olist_order_reviews' is missing from SQL.\", \"details\": {\"required_table\": \"olist_order_reviews\"}}, {\"code\": \"aggregation_missing\", \"message\": \"Query requires aggregation but no aggregate function was detected.\", \"details\": {}}, {\"code\": \"topn_order_missing\", \"message\": \"Top-N intent detected but SQL is missing ORDER BY.\", \"details\": {}}], \"obligations\": {\"required_tables\": [], \"required_fact_tables\": [\"olist_customers\", \"olist_order_items\", \"olist_order_payments\", \"olist_order_reviews\", \"olist_orders\"], \"required_years\": [], \"required_status_values\": [\"delivered\"], \"required_metrics\": [\"average\", \"payment\"], \"requires_topn\": true, \"requires_aggregation\": true, \"requires_distinct\": false, \"requires_order_desc\": true, \"requires_join\": true}, \"query\": \"Please identify the top three customers, based on their customer_unique_id, who have the highest number of delivered orders, and provide the average payment value, city, and state for each of these customers.\", \"sql\": \"SELECT order_id, customer_id, order_status FROM temp.main.olist_orders WHERE order_status = 'delivered' LIMIT 5;\", \"available_tables\": [\"olist_customers\", \"olist_geolocation\", \"olist_order_items\", \"olist_order_payments\", \"olist_order_reviews\", \"olist_orders\", \"olist_products\", \"olist_products_dataset\", \"olist_sellers\", \"product_category_name_translation\"]}}"
+      ],
+      "guardrail_stop_reason": "SQL guardrail blocked query generation after 3 attempts. Please revise the SQL constraints or prompt.",
+      "row_count": null,
+      "columns": null
+    },
+    {
+      "instance_id": "local058",
+      "db": "education_business",
+      "service_error": "Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+      "has_result": false,
+      "assistant_text": null,
+      "sql_attempt_count": 0,
+      "guardrail_error_count": 0,
+      "guardrail_error_samples": [],
+      "guardrail_stop_reason": null,
+      "row_count": null,
+      "columns": null
+    },
+    {
+      "instance_id": "local163",
+      "db": "education_business",
+      "service_error": "Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+      "has_result": false,
+      "assistant_text": null,
+      "sql_attempt_count": 0,
+      "guardrail_error_count": 0,
+      "guardrail_error_samples": [],
+      "guardrail_stop_reason": null,
+      "row_count": null,
+      "columns": null
+    },
+    {
+      "instance_id": "local075",
+      "db": "bank_sales_trading",
+      "service_error": "Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+      "has_result": false,
+      "assistant_text": null,
+      "sql_attempt_count": 0,
+      "guardrail_error_count": 0,
+      "guardrail_error_samples": [],
+      "guardrail_stop_reason": null,
+      "row_count": null,
+      "columns": null
+    }
+  ]
+}
