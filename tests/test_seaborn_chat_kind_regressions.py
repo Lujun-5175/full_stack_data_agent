@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from databao.agent.core.executor import ExecutionResult
+from databao.agent.visualizers.chart_registry import supported_chart_kinds
 from databao.agent.visualizers.seaborn_chat import SeabornChatVisualizer
 
 
@@ -108,9 +109,86 @@ def test_end_to_end_pdf_case_keeps_barplot_contract(monkeypatch: pytest.MonkeyPa
     assert result.meta["chart_debug"]["final_plan"]["kind"] == "barplot"
 
 
+def test_duplicate_column_labels_do_not_break_barplot_render(monkeypatch: pytest.MonkeyPatch) -> None:
+    visualizer = SeabornChatVisualizer(llm_config=object())
+    dataframe = pd.DataFrame(
+        [
+            ["Month-to-month", 5174, 4100],
+            ["Two year", 1869, 1500],
+        ],
+        columns=["Churn", "total_customers", "total_customers"],
+    )
+    plan = {
+        "kind": "barplot",
+        "x": "Churn",
+        "y": "total_customers",
+        "hue": None,
+        "variables": [],
+        "value": None,
+        "mode": None,
+        "title": "Total customers by churn",
+        "confidence": 0.98,
+        "reason": "explicit bar chart request",
+    }
+    monkeypatch.setattr(visualizer, "_call_chart_planner", lambda messages: json.dumps(plan))
+
+    result = visualizer.visualize(
+        "请画一个柱状图，横轴：Churn，纵轴：total_customers",
+        ExecutionResult(text="ok", meta={}, df=dataframe),
+    )
+
+    assert result.meta["planner"] == "llm_json"
+    assert result.meta["planner_status"] == "ready"
+    assert result.meta["plot_error"] is None
+    assert result.plot is not None
+    assert result.dataframe is not None
+    assert result.dataframe.columns.is_unique
+
+
 def test_histogram_boolean_x_fails_fast() -> None:
     visualizer = SeabornChatVisualizer()
     dataframe = pd.DataFrame({"Churn": [True, False, True]})
 
     with pytest.raises(ValueError, match="histplot does not support boolean x columns"):
         visualizer._render("histogram", dataframe, {"x": "Churn", "y": None, "hue": None, "variables": []})
+
+
+def test_allowed_kinds_align_with_registry() -> None:
+    visualizer = SeabornChatVisualizer()
+    dataframe = pd.DataFrame({"x": ["A", "B"], "y": [1, 2]})
+
+    for kind in supported_chart_kinds():
+        plan = type(
+            "_Plan",
+            (),
+            {
+                "kind": kind,
+                "x": "x" if kind not in {"scatterplot", "jointplot", "pairplot", "heatmap", "histogram"} else None,
+                "y": "y" if kind not in {"countplot", "histogram", "pairplot", "heatmap"} else None,
+                "hue": None,
+                "value": None,
+                "variables": ["y"] if kind in {"pairplot", "heatmap"} else [],
+                "orientation": "vertical",
+                "stack_mode": "none",
+                "normalize_mode": "none",
+                "category_order": [],
+                "show_value_labels": False,
+                "explicit_fields": {},
+                "confidence": "high",
+                "source_df_role": "plot_ready",
+            },
+        )()
+        errors = visualizer._validate_chart_plan("show chart", dataframe, plan)
+        assert not any("Invalid chart kind" in error for error in errors)
+
+
+def test_stripplot_fallback_preserves_categorical_axis_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    visualizer = SeabornChatVisualizer()
+    dataframe = pd.DataFrame({"segment": ["A", "A", "B"], "value": [1.0, 2.0, 3.0]})
+    monkeypatch.setattr("databao.agent.visualizers.seaborn_chat.sns", None)
+
+    figure = visualizer._render("stripplot", dataframe, {"x": "segment", "y": "value", "hue": None, "variables": []})
+    axis = figure.axes[0]
+    labels = {label.get_text() for label in axis.get_xticklabels() if label.get_text()}
+
+    assert labels == {"A", "B"}

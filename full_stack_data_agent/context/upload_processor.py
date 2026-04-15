@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 TEXT_EXTENSIONS = {".txt", ".md", ".yaml", ".yml", ".toml", ".py", ".log"}
 TABULAR_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json"}
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 SUPPORTED_UPLOAD_EXTENSIONS = tuple(
     sorted(
         {
@@ -114,6 +115,10 @@ def _json_dataframe_is_tabular(dataframe: pd.DataFrame) -> bool:
 
 
 def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None = None) -> UploadedFileContext | None:
+    if len(content) > _MAX_UPLOAD_BYTES:
+        logger.warning("Uploaded file %s exceeds size limit (%d bytes)", file_name, len(content))
+        return None
+
     suffix = Path(file_name).suffix.lower()
     if suffix in {".xlsx", ".xls"}:
         try:
@@ -128,8 +133,11 @@ def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None 
         dataframe = sheets[active_sheet_name]
         if not isinstance(dataframe, pd.DataFrame) or dataframe.empty or not len(dataframe.columns):
             return None
-        summary_prefix = f"Excel workbook with {len(sheet_names)} sheet(s)."
-        extra_summary = f"Processing sheet '{active_sheet_name}'."
+        summary_prefix = (
+            f"Excel workbook with {len(sheet_names)} sheet(s). "
+            f"Only the first sheet '{active_sheet_name}' is currently loaded."
+        )
+        extra_summary = f"Previewing first sheet '{active_sheet_name}'."
         context = _tabular_context(
             file_name=file_name,
             mime_type=mime_type,
@@ -201,14 +209,12 @@ def process_uploaded_file(file_name: str, content: bytes, mime_type: str | None 
 
     if suffix == ".json" or (mime_type and "json" in mime_type.lower()):
         dataframe: pd.DataFrame | None = None
-        for reader in (lambda: pd.read_json(BytesIO(content)), lambda: pd.read_json(StringIO(text))):
-            try:
-                candidate = reader()
-            except Exception:
-                continue
-            if isinstance(candidate, pd.DataFrame) and _json_dataframe_is_tabular(candidate):
-                dataframe = candidate
-                break
+        try:
+            candidate = pd.read_json(StringIO(text))
+        except Exception:
+            candidate = None
+        if isinstance(candidate, pd.DataFrame) and _json_dataframe_is_tabular(candidate):
+            dataframe = candidate
         if dataframe is not None:
             context = _tabular_context(
                 file_name=file_name,

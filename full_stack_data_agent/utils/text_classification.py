@@ -55,11 +55,6 @@ EXPLICIT_CHART_REQUEST_MARKERS = (
     "小提琴图",
 )
 
-# Backward-compatible aliases for existing imports.
-EXPLICIT_VISUALIZATION_MARKERS = EXPLICIT_CHART_REQUEST_MARKERS
-CHART_INTENT_MARKERS = EXPLICIT_CHART_REQUEST_MARKERS
-
-
 def series_fullmatch(series: pd.Series, pattern: re.Pattern[str]) -> pd.Series:
     values = series.astype("string")
-    return values.map(lambda value: bool(pattern.fullmatch(str(value))) if not pd.isna(value) else False)
+    return values.str.fullmatch(pattern, na=False)

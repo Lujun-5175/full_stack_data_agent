@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from databao.agent.visualizers.chart_registry import canonicalize_chart_kind, supported_chart_kinds
 
 
 class ChartRequest(BaseModel):
-    kind: Literal["barplot", "lineplot", "scatterplot", "boxplot", "histplot", "countplot"]
+    kind: str
     x: str | None = None
     y: str | None = None
     hue: str | None = None
@@ -27,7 +29,14 @@ class ChartRequest(BaseModel):
     mode: str | None = None
     reason: str | None = None
 
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, value: str) -> str:
+        canonical = canonicalize_chart_kind(value)
+        if canonical not in supported_chart_kinds():
+            raise ValueError(f"Unsupported chart kind: {value}")
+        return str(canonical)
+
 
 # Backward-compatible alias.
 ChartPlan = ChartRequest
-

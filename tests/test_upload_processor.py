@@ -66,6 +66,7 @@ def test_process_uploaded_excel_file_uses_first_sheet_and_records_sheet_metadata
     assert result.tabular_payload is not None
     assert "alpha" in result.tabular_payload.lower()
     assert "Excel workbook" in result.summary
+    assert "Only the first sheet" in result.summary
     assert "Overview" in result.summary
 
 
@@ -104,6 +105,11 @@ def test_process_uploaded_json_file_falls_back_to_text_when_not_tabular(monkeypa
 def test_process_uploaded_file_returns_none_for_empty_or_invalid_utf8() -> None:
     assert process_uploaded_file("empty.txt", b"   \n") is None
     assert process_uploaded_file("bad.txt", b"\xff\xfe\x00\x00") is None
+
+
+def test_process_uploaded_file_rejects_oversized_payload() -> None:
+    payload = b"a" * ((50 * 1024 * 1024) + 1)
+    assert process_uploaded_file("too_large.txt", payload) is None
 
 
 def test_supported_upload_extensions_include_text_and_tabular_types() -> None:

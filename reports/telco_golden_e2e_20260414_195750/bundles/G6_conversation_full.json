@@ -1,0 +1,603 @@
+{
+  "exported_at": "2026-04-14T20:47:46-04:00",
+  "conversation_id": "f71491e9-22a3-4512-aa4e-cbd9db4cff98",
+  "summary": {
+    "exported_at": "2026-04-14T20:47:46-04:00",
+    "conversation_id": "f71491e9-22a3-4512-aa4e-cbd9db4cff98",
+    "turn_count": 1,
+    "provider_status": null,
+    "settings": null,
+    "app_version": "0.1.0",
+    "git_hash": "09974fa",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "uploaded_files": [],
+    "debug_state": {
+      "uploaded_contexts": [
+        {
+          "file_name": "Telco-Customer-Churn.csv",
+          "mime_type": "text/csv",
+          "size_bytes": 977501,
+          "summary": "CSV table with 7043 rows and 21 columns.",
+          "snippets": [
+            "1. | customerID   | gender   |   SeniorCitizen | Partner   | Dependents   |   tenure | PhoneService   | MultipleLines    | InternetService   | OnlineSecurity   | OnlineBackup   | DeviceProtection   | TechSupport   | Streami",
+            "2. |:-------------|:---------|----------------:|:----------|:-------------|---------:|:---------------|:-----------------|:------------------|:-----------------|:---------------|:-------------------|:--------------|:-------",
+            "3. | 7590-VHVEG   | Female   |               0 | Yes       | No           |        1 | No             | No phone service | DSL               | No               | Yes            | No                 | No            | No     ",
+            "4. | 5575-GNVDE   | Male     |               0 | No        | No           |       34 | Yes            | No               | DSL               | Yes              | No             | Yes                | No            | No     ",
+            "5. | 3668-QPYBK   | Male     |               0 | No        | No           |        2 | Yes            | No               | DSL               | Yes              | Yes            | No                 | No            | No     ",
+            "6. | 7795-CFOCW   | Male     |               0 | No        | No           |       45 | No             | No phone service | DSL               | Yes              | No             | Yes                | Yes           | No     "
+          ],
+          "extracted_text": "| customerID   | gender   |   SeniorCitizen | Partner   | Dependents   |   tenure | PhoneService   | MultipleLines    | InternetService   | OnlineSecurity   | OnlineBackup   | DeviceProtection   | TechSupport   | StreamingTV   | StreamingMovies   | Contract       | PaperlessBilling   | PaymentMethod             |   MonthlyCharges |   TotalCharges | Churn   |\n|:-------------|:---------|----------------:|:----------|:-------------|---------:|:---------------|:-----------------|:------------------|:-----------------|:---------------|:-------------------|:--------------|:--------------|:------------------|:---------------|:-------------------|:--------------------------|-----------------:|---------------:|:--------|\n| 7590-VHVEG   | Female   |               0 | Yes       | No           |        1 | No             | No phone service | DSL               | No               | Yes            | No                 | No            | No            | No                | Month-to-month | Yes                | Electronic check          |            29.85 |          29.85 | No      |\n| 5575-GNVDE   | Male     |               0 | No        | No           |       34 | Yes            | No               | DSL               | Yes              | No             | Yes                | No            | No            | No                | One year       | No                 | Mailed check              |            56.95 |        1889.5  | No      |\n| 3668-QPYBK   | Male     |               0 | No        | No           |        2 | Yes            | No               | DSL               | Yes              | Yes            | No                 | No            | No            | No                | Month-to-month | Yes                | Mailed check              |            53.85 |         108.15 | Yes     |\n| 7795-CFOCW   | Male     |               0 | No        | No           |       45 | No             | No phone service | DSL               | Yes              | No             | Yes                | Yes           | No            | No                | One year       | No                 | Bank transfer (automatic) |            42.3  |        1840.75 | No      |\n| 9237-HQITU   | Female   |               0 | No        | No           |        2 | Yes            | No               | Fiber optic       | No               | No             | No                 | No            | No            | No                | Month-to-month | Yes                | Electronic check          |            70.7  |         151.65 | Yes     |",
+          "tabular_payload": "customerID,gender,SeniorCitizen,Partner,Dependents,tenure,PhoneService,MultipleLines,InternetService,OnlineSecurity,OnlineBackup,DeviceProtection,TechSupport,StreamingTV,StreamingMovies,Contract,PaperlessBilling,PaymentMethod,MonthlyCharges,TotalCharges,Churn\r\n7590-VHVEG,Female,0,Yes,No,1,No,No phone service,DSL,No,Yes,No,No,No,No,Month-to-month,Yes,Electronic check,29.85,29.85,No\r\n5575-GNVDE,Male,0,No,No,34,Yes,No,DSL,Yes,No,Yes,No,No,No,One year,No,Mailed check,56.95,1889.5,No\r\n3668-QPYBK,Male,0,No,No,2,Yes,No,DSL,Yes,Yes,No,No,No,No,Month-to-month,Yes,Mailed check,53.85,108.15,Yes\r\n7795-CFOCW,Male,0,No,No,45,No,No phone service,DSL,Yes,No,Yes,Yes,No,No,One year,No,Bank transfer (automatic),42.3,1840.75,No\r\n9237-HQITU,Female,0,No,No,2,Yes,No,Fiber optic,No,No,No,No,No,No,Month-to-month,Yes,Electronic check,70.7,151.65,Yes\r\n9305-CDSKC,Female,0,No,No,8,Yes,Yes,Fiber optic,No,No,Yes,No,Yes,Yes,Month-to-month,Yes,Electronic check,99.65,820.5,Yes\r\n1452-KIOVK,Male,0,No,Yes,22,Yes,Yes,Fiber optic,No,Yes,No,No,Yes,No,Month-to-month,Yes,Credit card (automatic),89.1,1949.4,No\r\n6713-OKOMC,Female,0,No,No,10,No,No phone service,DSL,Yes,No,No,No,No,No,Month-to-month,No,Mailed check,29.75,301.9,No\r\n7892-POOKP,Female,0,Yes,No,28,Yes,Yes,Fiber optic,No,No,Yes,Yes,Yes,Yes,Month-to-month,Yes,Electronic check,104.8,3046.05,Yes\r\n6388-TABGU,Male,0,No,Yes,62,Yes,No,DSL,Yes,Yes,No,No,No,No,One year,No,Bank transfer (automatic),56.15,3487.95,No\r\n9763-GRSKD,Male,0,Yes,Yes,13,Yes,No,DSL,Yes,No,No,No,No,No,Month-to-month,Yes,Mailed check,49.95,587.45,No\r\n7469-LKBCI,Male,0,No,No,16,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,Two year,No,Credit card (automatic),18.95,326.8,No\r\n8091-TTVAX,Male,0,Yes,No,58,Yes,Yes,Fiber optic,No,No,Yes,No,Yes,Yes,One year,No,Credit card (automatic),100.35,5681.1,No\r\n0280-XJGEX,Male,0,No,No,49,Yes,Yes,Fiber optic,No,Yes,Yes,No,Yes,Yes,Month-to-month,Yes,Bank transfer (automatic),103.7,5036.3,Yes\r\n5129-JLPIS,Male,0,No,No,25,Yes,No,Fiber optic,Yes,No,Yes,Yes,Yes,Yes,Month-to-month,Yes,Electronic check,105.5,2686.05,No\r\n3655-SNQYZ,Female,0,Yes,Yes,69,Yes,Yes,Fiber optic,Yes,Yes,Yes,Yes,Yes,Yes,Two year,No,Credit card (automatic),113.25,7895.15,No\r\n8191-XWSZG,Female,0,No,No,52,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,One year,No,Mailed check,20.65,1022.95,No\r\n9959-WOFKT,Male,0,No,Yes,71,Yes,Yes,Fiber optic,Yes,No,Yes,No,Yes,Yes,Two year,No,Bank transfer (automatic),106.7,7382.25,No\r\n4190-MFLUW,Female,0,Yes,Yes,10,Yes,No,DSL,No,No,Yes,Yes,No,No,Month-to-month,No,Credit card (automatic),55.2,528.35,Yes\r\n4183-MYFRB,Female,0,No,No,21,Yes,No,Fiber optic,No,Yes,Yes,No,No,Yes,Month-to-month,Yes,Electronic check,90.05,1862.9,No\r\n8779-QRDMV,Male,1,No,No,1,No,No phone service,DSL,No,No,Yes,No,No,Yes,Month-to-month,Yes,Electronic check,39.65,39.65,Yes\r\n1680-VDCWW,Male,0,Yes,No,12,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,One year,No,Bank transfer (automatic),19.8,202.25,No\r\n1066-JKSGK,Male,0,No,No,1,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,Month-to-month,No,Mailed check,20.15,20.15,Yes\r\n3638-WEABW,Female,0,Yes,No,58,Yes,Yes,DSL,No,Yes,No,Yes,No,No,Two year,Yes,Credit card (automatic),59.9,3505.1,No\r\n6322-HRPFA,Male,0,Yes,Yes,49,Yes,No,DSL,Yes,Yes,No,Yes,No,No,Month-to-month,No,Credit card (automatic),59.6,2970.3,No\r\n6865-JZNKO,Female,0,No,No,30,Yes,No,DSL,Yes,Yes,No,No,No,No,Month-to-month,Yes,Bank transfer (automatic),55.3,1530.6,No\r\n6467-CHFZW,Male,0,Yes,Yes,47,Yes,Yes,Fiber optic,No,Yes,No,No,Yes,Yes,Month-to-month,Yes,Electronic check,99.35,4749.15,Yes\r\n8665-UTDHZ,Male,0,Yes,Yes,1,No,No phone service,DSL,No,Yes,No,No,No,No,Month-to-month,No,Electronic check,30.2,30.2,Yes\r\n5248-YGIJN,Male,0,Yes,No,72,Yes,Yes,DSL,Yes,Yes,Yes,Yes,Yes,Yes,Two year,Yes,Credit card (automatic),90.25,6369.45,No\r\n8773-HHUOZ,Female,0,No,Yes,17,Yes,No,DSL,No,No,No,No,Yes,Yes,Month-to-month,Yes,Mailed check,64.7,1093.1,Yes\r\n3841-NFECX,Female,1,Yes,No,71,Yes,Yes,Fiber optic,Yes,Yes,Yes,Yes,No,No,Two year,Yes,Credit card (automatic),96.35,6766.95,No\r\n4929-XIHVW,Male,1,Yes,No,2,Yes,No,Fiber optic,No,No,Yes,No,Yes,Yes,Month-to-month,Yes,Credit card (automatic),95.5,181.65,No\r\n6827-IEAUQ,Female,0,Yes,Yes,27,Yes,No,DSL,Yes,Yes,Yes,Yes,No,No,One year,No,Mailed check,66.15,1874.45,No\r\n7310-EGVHZ,Male,0,No,No,1,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,Month-to-month,No,Bank transfer (automatic),20.2,20.2,No\r\n3413-BMNZE,Male,1,No,No,1,Yes,No,DSL,No,No,No,No,No,No,Month-to-month,No,Bank transfer (automatic),45.25,45.25,No\r\n6234-RAAPL,Female,0,Yes,Yes,72,Yes,Yes,Fiber optic,Yes,Yes,No,Yes,Yes,No,Two year,No,Bank transfer (automatic),99.9,7251.7,No\r\n6047-YHPVI,Male,0,No,No,5,Yes,No,Fiber optic,No,No,No,No,No,No,Month-to-month,Yes,Electronic check,69.7,316.9,Yes\r\n6572-ADKRS,Female,0,No,No,46,Yes,No,Fiber optic,No,No,Yes,No,No,No,Month-to-month,Yes,Credit card (automatic),74.8,3548.3,No\r\n5380-WJKOV,Male,0,No,No,34,Yes,Yes,Fiber optic,No,Yes,Yes,No,Yes,Yes,Month-to-month,Yes,Electronic check,106.35,3549.25,Yes\r\n8168-UQWWF,Female,0,No,No,11,Yes,Yes,Fiber optic,No,No,Yes,No,Yes,Yes,Month-to-month,Yes,Bank transfer (automatic),97.85,1105.4,Yes\r\n8865-TNMNX,Male,0,Yes,Yes,10,Yes,No,DSL,No,Yes,No,No,No,No,One year,No,Mailed check,49.55,475.7,No\r\n9489-DEDVP,Female,0,Yes,Yes,70,Yes,Yes,DSL,Yes,Yes,No,No,Yes,No,Two year,Yes,Credit card (automatic),69.2,4872.35,No\r\n9867-JCZSP,Female,0,Yes,Yes,17,Yes,No,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,One year,No,Mailed check,20.75,418.25,No\r\n4671-VJLCL,Female,0,No,No,63,Yes,Yes,DSL,Yes,Yes,Yes,Yes,Yes,No,Two year,Yes,Credit card (automatic),79.85,4861.45,No\r\n4080-IIARD,Female,0,Yes,No,13,Yes,Yes,DSL,Yes,Yes,No,Yes,Yes,No,Month-to-month,Yes,Electronic check,76.2,981.45,No\r\n3714-NTNFO,Female,0,No,No,49,Yes,Yes,Fiber optic,No,No,No,No,No,Yes,Month-to-month,Yes,Electronic check,84.5,3906.7,No\r\n5948-UJZLF,Male,0,No,No,2,Yes,No,DSL,No,Yes,No,No,No,No,Month-to-month,No,Mailed check,49.25,97,No\r\n7760-OYPDY,Female,0,No,No,2,Yes,No,Fiber optic,No,No,No,No,Yes,No,Month-to-month,Yes,Electronic check,80.65,144.15,Yes\r\n7639-LIAYI,Male,0,No,No,52,Yes,Yes,DSL,Yes,No,No,Yes,Yes,Yes,Two year,Yes,Credit card (automatic),79.75,4217.8,No\r\n2954-PIBKO,Female,0,Yes,Yes,69,Yes,Yes,DSL,Yes,No,Yes,Yes,No,No,Two year,Yes,Credit card (automatic),64.15,4254.1,No\r\n8012-SOUDQ,Female,1,No,No,43,Yes,Yes,Fiber optic,No,Yes,No,No,Yes,No,Month-to-month,Yes,Electronic check,90.25,3838.75,No\r\n9420-LOJKX,Female,0,No,No,15,Yes,No,Fiber optic,Yes,Yes,No,No,Yes,Yes,Month-to-month,Yes,Credit card (automatic),99.1,1426.4,Yes\r\n6575-SUVOI,Female,1,Yes,No,25,Yes,Yes,DSL,Yes,No,No,Yes,Yes,No,Month-to-month,Yes,Credit card (automatic),69.5,1752.65,No\r\n7495-OOKFY,Female,1,Yes,No,8,Yes,Yes,Fiber optic,No,Yes,No,No,No,No,Month-to-month,Yes,Credit card (automatic),80.65,633.3,Yes\r\n4667-QONEA,Female,1,Yes,Yes,60,Yes,No,DSL,Yes,Yes,Yes,Yes,No,Yes,One year,Yes,Credit card (automatic),74.85,4456.35,No\r\n1658-BYGOY,Male,1,No,No,18,Yes,Yes,Fiber optic,No,No,No,No,Yes,Yes,Month-to-month,Yes,Electronic check,95.45,1752.55,Yes\r\n8769-KKTPH,Female,0,Yes,Yes,63,Yes,Yes,Fiber optic,Yes,No,No,No,Yes,Yes,One year,Yes,Credit card (automatic),99.65,6311.2,No\r\n5067-XJQFU,Male,1,Yes,Yes,66,Yes,Yes,Fiber optic,No,Yes,Yes,Yes,Yes,Yes,One year,Yes,Electronic check,108.45,7076.35,No\r\n3957-SQXML,Female,0,Yes,Yes,34,Yes,Yes,No,No internet service,No internet service,No internet service,No internet service,No internet service,No internet service,Two year,No,Credit card (automatic),24.95,894.3,No\r\n5954-BDFSG,Fema... (truncated, len=977501)",
+          "is_tabular": true,
+          "table_name": "telco_customer_churn",
+          "row_count": 7043,
+          "columns": [
+            "customerID",
+            "gender",
+            "SeniorCitizen",
+            "Partner",
+            "Dependents",
+            "tenure",
+            "PhoneService",
+            "MultipleLines",
+            "InternetService",
+            "OnlineSecurity",
+            "OnlineBackup",
+            "DeviceProtection",
+            "TechSupport",
+            "StreamingTV",
+            "StreamingMovies",
+            "Contract",
+            "PaperlessBilling",
+            "PaymentMethod",
+            "MonthlyCharges",
+            "TotalCharges",
+            "Churn"
+          ],
+          "semantic_profile": {
+            "column_type_hints": {
+              "customerID": {
+                "semantic_type": "key",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high uniqueness and non-numeric shape']",
+                  "_max_depth_reached": true
+                }
+              },
+              "gender": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "SeniorCitizen": {
+                "semantic_type": "boolean",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high boolean token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "Partner": {
+                "semantic_type": "boolean",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high boolean token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "Dependents": {
+                "semantic_type": "boolean",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high boolean token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "tenure": {
+                "semantic_type": "measure",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high numeric token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "PhoneService": {
+                "semantic_type": "boolean",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high boolean token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "MultipleLines": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "InternetService": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "OnlineSecurity": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "OnlineBackup": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "DeviceProtection": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "TechSupport": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "StreamingTV": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "StreamingMovies": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "Contract": {
+                "semantic_type": "categorical",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "PaperlessBilling": {
+                "semantic_type": "boolean",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high boolean token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "PaymentMethod": {
+                "semantic_type": "categorical",
+                "confidence": 0.999,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['remaining strings treated as categorical']",
+                  "_max_depth_reached": true
+                }
+              },
+              "MonthlyCharges": {
+                "semantic_type": "measure",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high numeric token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "TotalCharges": {
+                "semantic_type": "measure",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high numeric token match rate']",
+                  "_max_depth_reached": true
+                }
+              },
+              "Churn": {
+                "semantic_type": "boolean",
+                "confidence": 1.0,
+                "reasons": {
+                  "_type": "list",
+                  "_repr": "['high boolean token match rate']",
+                  "_max_depth_reached": true
+                }
+              }
+            },
+            "alias_map": {
+              "customerid": [
+                "customerID"
+              ],
+              "gender": [
+                "gender"
+              ],
+              "seniorcitizen": [
+                "SeniorCitizen"
+              ],
+              "partner": [
+                "Partner"
+              ],
+              "dependents": [
+                "Dependents"
+              ],
+              "tenure": [
+                "tenure"
+              ],
+              "phoneservice": [
+                "PhoneService"
+              ],
+              "multiplelines": [
+                "MultipleLines"
+              ],
+              "internetservice": [
+                "InternetService"
+              ],
+              "onlinesecurity": [
+                "OnlineSecurity"
+              ],
+              "onlinebackup": [
+                "OnlineBackup"
+              ],
+              "deviceprotection": [
+                "DeviceProtection"
+              ],
+              "techsupport": [
+                "TechSupport"
+              ],
+              "streamingtv": [
+                "StreamingTV"
+              ],
+              "streamingmovies": [
+                "StreamingMovies"
+              ],
+              "contract": [
+                "Contract"
+              ],
+              "paperlessbilling": [
+                "PaperlessBilling"
+              ],
+              "paymentmethod": [
+                "PaymentMethod"
+              ],
+              "monthlycharges": [
+                "MonthlyCharges"
+              ],
+              "totalcharges": [
+                "TotalCharges"
+              ],
+              "churn": [
+                "Churn"
+              ]
+            },
+            "canonical_categorical_value_maps": {
+              "SeniorCitizen": {
+                "0": "false",
+                "1": "true"
+              },
+              "Partner": {
+                "no": "false",
+                "yes": "true"
+              },
+              "Dependents": {
+                "no": "false",
+                "yes": "true"
+              },
+              "PhoneService": {
+                "no": "false",
+                "yes": "true"
+              },
+              "PaperlessBilling": {
+                "no": "false",
+                "yes": "true"
+              },
+              "Churn": {
+                "no": "false",
+                "yes": "true"
+              }
+            },
+            "key_candidates": [
+              "customerID"
+            ],
+            "time_candidates": [],
+            "measure_candidates": [
+              "tenure",
+              "MonthlyCharges",
+              "TotalCharges"
+            ],
+            "profiling_summary": {
+              "row_count": 7043,
+              "column_count": 21,
+              "column_summaries": [
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'customerID', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 7043, 'missing_ratio': 0.0, 'hint': 'key', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'gender', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'SeniorCitizen', 'original_dtype': 'int64', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'boolean', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'Partner', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'boolean', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'Dependents', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'boolean', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'tenure', 'original_dtype': 'int64', 'non_null_count': 7043, 'unique_count': 73, 'missing_ratio': 0.0, 'hint': 'measure', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'PhoneService', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'boolean', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'MultipleLines', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'InternetService', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'OnlineSecurity', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'OnlineBackup', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'DeviceProtection', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'TechSupport', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'StreamingTV', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'StreamingMovies', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'Contract', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 3, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'PaperlessBilling', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'boolean', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'PaymentMethod', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 4, 'missing_ratio': 0.0, 'hint': 'categorical', 'confidence': 0.999}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'MonthlyCharges', 'original_dtype': 'float64', 'non_null_count': 7043, 'unique_count': 1585, 'missing_ratio': 0.0, 'hint': 'measure', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'TotalCharges', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 6531, 'missing_ratio': 0.0, 'hint': 'measure', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                },
+                {
+                  "_type": "dict",
+                  "_repr": "{'column': 'Churn', 'original_dtype': 'str', 'non_null_count': 7043, 'unique_count': 2, 'missing_ratio': 0.0, 'hint': 'boolean', 'confidence': 1.0}",
+                  "_max_depth_reached": true
+                }
+              ],
+              "high_cardinality_columns": [
+                "customerID",
+                "TotalCharges"
+              ]
+            },
+            "source_format": "csv"
+          }
+        }
+      ]
+    },
+    "last_result": null,
+    "last_runtime_snapshot": null
+  },
+  "turn_count": 1,
+  "turns": [
+    {
+      "turn_index": 1,
+      "turn_id": "a5f8beac-0a42-4f78-b895-ab3bec7cfeb7",
+      "role": "assistant",
+      "user_message": {
+        "role": "user",
+        "content": "请分析不同 Contract 类型在收入稳定性上的差异，并严格按下面步骤输出：\n\n1. 按 Contract 分组，生成结果表，包含：\n\n* Contract\n* total_customers\n* churned_customers（Churn = Yes）\n* churn_rate\n* avg_monthly_charges = MonthlyCharges 平均值\n* avg_total_charges = TotalCharges 平均值\n\n2. 按 churn_rate 从高到低排序。\n3. 画第一张竖向柱状图：\n\n* 图表标题：Churn Rate by Contract Type\n* x 轴：Contract\n* y 轴：churn_rate\n* y 轴显示为百分比\n\n4. 再画第二张竖向柱状图：\n\n* 图表标题：Average Total Charges by Contract Type\n* x 轴：Contract\n* y 轴：avg_total_charges\n\n5. 最后用 5-6 句话解释：\n\n* 哪类合同 churn_rate 最高\n* 哪类合同 avg_total_charges 最高\n* churn_rate 与 avg_total_charges 是否看起来负相关\n* 这对收入稳定性意味着什么\n  请按“结果表 → 图1 → 图2 → 解释”输出。",
+        "message_id": "10895510-75d1-4d5c-9dc5-ddaf0c8e1dfd",
+        "created_at": 1776212856.2444782,
+        "status": "complete"
+      },
+      "assistant_message": {
+        "role": "assistant",
+        "content": "Request failed: Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+        "message_id": "e9f2c694-88a3-4492-ac2b-7b830acd8dc4",
+        "created_at": 1776214066.7713873,
+        "status": "complete"
+      },
+      "timestamp": {
+        "user": 1776212856.2444782,
+        "assistant": 1776214066.7713873
+      },
+      "text": {
+        "user": "请分析不同 Contract 类型在收入稳定性上的差异，并严格按下面步骤输出：\n\n1. 按 Contract 分组，生成结果表，包含：\n\n* Contract\n* total_customers\n* churned_customers（Churn = Yes）\n* churn_rate\n* avg_monthly_charges = MonthlyCharges 平均值\n* avg_total_charges = TotalCharges 平均值\n\n2. 按 churn_rate 从高到低排序。\n3. 画第一张竖向柱状图：\n\n* 图表标题：Churn Rate by Contract Type\n* x 轴：Contract\n* y 轴：churn_rate\n* y 轴显示为百分比\n\n4. 再画第二张竖向柱状图：\n\n* 图表标题：Average Total Charges by Contract Type\n* x 轴：Contract\n* y 轴：avg_total_charges\n\n5. 最后用 5-6 句话解释：\n\n* 哪类合同 churn_rate 最高\n* 哪类合同 avg_total_charges 最高\n* churn_rate 与 avg_total_charges 是否看起来负相关\n* 这对收入稳定性意味着什么\n  请按“结果表 → 图1 → 图2 → 解释”输出。",
+        "assistant": "Request failed: Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT"
+      },
+      "metadata_keys": [
+        "error",
+        "model",
+        "provider",
+        "status",
+        "used_databao"
+      ],
+      "metadata": {
+        "provider": "ollama",
+        "model": "gemma4:e4b",
+        "used_databao": true,
+        "error": "Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+        "status": "error"
+      },
+      "debug_detailed": {
+        "error": "Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+        "provider_status": {
+          "provider": "ollama",
+          "base_url": "http://127.0.0.1:11434",
+          "model": "gemma4:e4b",
+          "connected": true,
+          "available_models": [
+            "nomic-embed-text:v1.5",
+            "gemma4:e4b"
+          ],
+          "api_key_present": false,
+          "fallback_provider": "ollama",
+          "fallback_connected": true,
+          "fallback_error": null,
+          "latency_ms": 14,
+          "error": null,
+          "checked_at": 1776212856.2444358
+        },
+        "uploaded_contexts": [
+          {
+            "file_name": "Telco-Customer-Churn.csv",
+            "table_name": "telco_customer_churn",
+            "is_tabular": true,
+            "row_count": 7043,
+            "columns": [
+              "customerID",
+              "gender",
+              "SeniorCitizen",
+              "Partner",
+              "Dependents",
+              "tenure",
+              "PhoneService",
+              "MultipleLines",
+              "InternetService",
+              "OnlineSecurity",
+              "OnlineBackup",
+              "DeviceProtection",
+              "TechSupport",
+              "StreamingTV",
+              "StreamingMovies",
+              "Contract",
+              "PaperlessBilling",
+              "PaymentMethod",
+              "MonthlyCharges",
+              "TotalCharges",
+              "Churn"
+            ]
+          }
+        ]
+      },
+      "workspace": null,
+      "grounded_response": null,
+      "binding_trace": null,
+      "sql_trace": null,
+      "completion_validation": null,
+      "normalization_reports": null,
+      "registered_tables": null,
+      "chart_summary": {
+        "primary_chart_artifact_id": null,
+        "plot_backend": null,
+        "plot_kind": null,
+        "plot_error": null,
+        "render_failed": false,
+        "chart_debug": {}
+      },
+      "plot_spec": null,
+      "plot_data": null,
+      "plot_meta": null,
+      "plot_backend": null,
+      "plot_kind": null,
+      "plot_error": null,
+      "plot_image_base64_present": false,
+      "errors": [
+        "Turn 1 [assistant] error: Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.",
+        "For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+        "Turn 1 [assistant] status: error",
+        "Turn 1 [assistant] provider_status.fallback_provider: ollama"
+      ]
+    }
+  ],
+  "workspace_index": [],
+  "binding_index": [],
+  "errors_and_warnings": [
+    "Turn 1 [assistant] error: Recursion limit of 50 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.",
+    "For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+    "Turn 1 [assistant] status: error",
+    "Turn 1 [assistant] provider_status.fallback_provider: ollama"
+  ]
+}

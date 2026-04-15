@@ -14,10 +14,3 @@ try:
     __all__ += ["ChartRequest", "SeabornChatResult", "SeabornChatVisualizer"]
 except Exception:
     pass
-
-try:
-    from databao.agent.visualizers.vega_chat import VegaChatResult, VegaChatVisualizer
-
-    __all__ += ["VegaChatResult", "VegaChatVisualizer"]
-except Exception:
-    pass

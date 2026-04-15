@@ -12,12 +12,26 @@ from dataclasses import dataclass, field
 from io import StringIO
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import pandas as pd
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
+from full_stack_data_agent.app.chart_contracts import (
+    build_chart_request_contract,
+    build_controlled_repair_prompt,
+    validate_chart_contract,
+)
+from full_stack_data_agent.app.binding_engine import resolve_binding_bundle
+from full_stack_data_agent.app.binding_intent import parse_binding_intent
+from full_stack_data_agent.app.llm_binding_intent import enrich_binding_intent_with_llm
 from full_stack_data_agent.app.dependencies import check_runtime_dependencies
 from full_stack_data_agent.app.normalization import normalize_dataframe
+from full_stack_data_agent.app.response_grounding import GroundedResponse
+from full_stack_data_agent.app.result_artifacts import ResultArtifact
+from full_stack_data_agent.app.result_workspace import ResultWorkspace
 from full_stack_data_agent.app.runtime_models import DatabaoSessionSnapshot, DatabaoTurnResult, RegisteredTable
 from full_stack_data_agent.config.provider_resolution import (
     ResolvedProviderConfig,
@@ -36,7 +50,9 @@ from full_stack_data_agent.llm.models import (
     ProviderTimeoutError,
     ProviderUnavailableError,
 )
-from full_stack_data_agent.utils.text_classification import CHART_INTENT_MARKERS
+from full_stack_data_agent.utils.json_extract import extract_first_json_object
+from full_stack_data_agent.utils.pandas_types import is_categorical_dtype
+from full_stack_data_agent.utils.text_classification import EXPLICIT_CHART_REQUEST_MARKERS
 
 if TYPE_CHECKING:
     from databao.agent.configs.llm import LLMConfig
@@ -139,6 +155,31 @@ _QUESTION_STOPWORDS = {
 _DESCRIPTION_CATEGORICAL_VALUE_LIMIT = 10
 _DESCRIPTION_MAX_LENGTH = 2000
 _PROVIDER_HEALTH_CACHE_TTL_SECONDS = 15.0
+_GUARDRAIL_BLOCK_MARKERS = (
+    "sql guardrail blocked query generation",
+    "sql_guardrail_error",
+    "guardrail blocked",
+)
+_DIAGNOSTIC_TEXT_MARKERS = (
+    "no data",
+    "missing data",
+    "database has no",
+    "blocked",
+    "error",
+    "失败",
+    "错误",
+    "没有",
+    "无法",
+    "需要",
+)
+_PSEUDO_SUCCESS_MARKERS = (
+    "analysis complete",
+    "analysis completed",
+    "successfully",
+    "已完成",
+    "分析完成",
+    "已经完成",
+)
 
 
 @dataclass
@@ -178,6 +219,7 @@ class DatabaoRuntime:
         self._settings = settings
         self._executor_type = executor_type
         self._sessions: dict[str, _DatabaoSession] = {}
+        self._session_lock = threading.RLock()
         self._description_registry: dict[str, set[str]] = {}
         self._fallback_domain_warning: str | None = None
         self._provider_health_cache: dict[str, tuple[float, ProviderHealth]] = {}
@@ -189,6 +231,127 @@ class DatabaoRuntime:
     @staticmethod
     def _normalize_whitespace(text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _is_diagnostic_dataframe(dataframe: pd.DataFrame | None) -> bool:
+        if dataframe is None or dataframe.empty:
+            return False
+        if len(dataframe) > 5:
+            return False
+        normalized_columns = {_normalize for _normalize in (str(column).strip().lower() for column in dataframe.columns)}
+        if {"category", "value"} <= normalized_columns:
+            return True
+        if {"category", "item", "count"} <= normalized_columns:
+            return True
+        text_like_columns = [
+            column
+            for column in dataframe.columns
+            if pd.api.types.is_string_dtype(dataframe[column])
+            or pd.api.types.is_object_dtype(dataframe[column])
+            or is_categorical_dtype(dataframe[column])
+        ]
+        if not text_like_columns:
+            return False
+        flattened = " ".join(str(value).lower() for value in dataframe[text_like_columns].fillna("").astype("string").stack())
+        if not flattened.strip():
+            return False
+        return any(marker in flattened for marker in _DIAGNOSTIC_TEXT_MARKERS)
+
+    @staticmethod
+    def _failure_response_text(query: str, failure_reason: str | None) -> str:
+        if DatabaoRuntime._looks_like_chinese(query):
+            reason = failure_reason or "本次查询未能通过 SQL 守护与结果校验。"
+            return (
+                f"本次请求未能完成：{reason}。"
+                "系统已严格中止后续业务总结、图表和解释，以避免输出误导性结果。"
+                "请调整查询或检查数据后重试。"
+            )
+        reason = failure_reason or "the query did not pass SQL guardrail and result validation."
+        return (
+            f"I couldn't complete this request: {reason} "
+            "I stopped business summary, chart generation, and result explanation to avoid misleading output. "
+            "Please adjust the query or dataset and retry."
+        )
+
+    @staticmethod
+    def _enforce_failed_completion_validation(
+        validation: dict[str, Any] | None,
+        *,
+        failure_reason: str | None,
+        chart_requested: bool,
+    ) -> dict[str, Any]:
+        payload = dict(validation or {})
+        payload["status"] = "failed"
+        payload["supplement_added"] = False
+        if failure_reason:
+            payload["failure_reason"] = failure_reason
+        missing = list(payload.get("missing_deliverables") or [])
+        for deliverable in ("table", "chart", "explanation"):
+            if deliverable == "chart" and not chart_requested:
+                continue
+            if deliverable not in missing:
+                missing.append(deliverable)
+        payload["missing_deliverables"] = missing
+        return payload
+
+    @staticmethod
+    def _detect_turn_failure_state(
+        *,
+        text: str,
+        dataframe: pd.DataFrame | None,
+    ) -> tuple[str | None, str | None]:
+        lowered = str(text or "").lower()
+        if any(marker in lowered for marker in _GUARDRAIL_BLOCK_MARKERS):
+            return "sql_guardrail_blocked", "SQL guardrail blocked query generation."
+        if DatabaoRuntime._is_diagnostic_dataframe(dataframe):
+            return "diagnostic_only_result", "Runtime returned diagnostic-only dataframe instead of business result."
+        return None, None
+
+    @staticmethod
+    def _extract_sql_guardrail_trace(thread_meta: dict[str, Any]) -> dict[str, Any]:
+        trace: dict[str, Any] = {
+            "query_obligations": thread_meta.get("query_obligations"),
+            "sql_retry_history": list(thread_meta.get("sql_retry_history") or []),
+            "sql_guardrail_reports": [],
+            "final_failure_reason": thread_meta.get("guardrail_stop_reason"),
+            "parsed_sql_summary": thread_meta.get("parsed_sql_summary"),
+            "execution_validation_report": thread_meta.get("execution_validation_report"),
+            "final_guardrail_status": thread_meta.get("final_guardrail_status"),
+            "repair_attempts": list(thread_meta.get("repair_attempts") or []),
+        }
+        messages = thread_meta.get("messages") or []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            artifact = getattr(message, "artifact", None)
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("error_type") != "sql_guardrail":
+                continue
+            payload = artifact.get("guardrail")
+            if not isinstance(payload, dict):
+                continue
+            report = payload.get("report")
+            if isinstance(report, dict):
+                trace["sql_guardrail_reports"].append(report)
+                trace["parsed_sql_summary"] = report.get("parsed_sql_summary") or trace.get("parsed_sql_summary")
+                trace["execution_validation_report"] = (
+                    report.get("execution_validation_report") or trace.get("execution_validation_report")
+                )
+                trace["final_guardrail_status"] = report.get("final_guardrail_status") or trace.get("final_guardrail_status")
+                if not trace["repair_attempts"]:
+                    trace["repair_attempts"] = list(report.get("repair_attempts") or [])
+                if trace.get("query_obligations") is None:
+                    trace["query_obligations"] = report.get("obligations")
+                trace["final_failure_reason"] = report.get("guardrail_report", {}).get("final_reason") or trace.get(
+                    "final_failure_reason"
+                )
+        if trace["sql_guardrail_reports"] and not trace["sql_retry_history"]:
+            trace["sql_retry_history"] = [
+                {"attempt": index + 1, "report": report}
+                for index, report in enumerate(trace["sql_guardrail_reports"])
+            ]
+        return trace
 
     def _trigger_explicit_deliverable_extraction(self, query: str) -> bool:
         lowered = query.lower()
@@ -214,45 +377,10 @@ class DatabaoRuntime:
         if not isinstance(raw_text, str):
             raw_text = str(raw_text)
 
-        parsed = self._extract_first_json_object(raw_text)
+        parsed = extract_first_json_object(raw_text)
         if parsed is None:
             raise ValueError("LLM response did not contain valid JSON")
         return parsed
-
-    @staticmethod
-    def _extract_first_json_object(text: str) -> dict[str, Any] | None:
-        start = text.find("{")
-        while start != -1:
-            depth = 0
-            in_string = False
-            escape = False
-            for index in range(start, len(text)):
-                char = text[index]
-                if in_string:
-                    if escape:
-                        escape = False
-                    elif char == "\\":
-                        escape = True
-                    elif char == '"':
-                        in_string = False
-                    continue
-                if char == '"':
-                    in_string = True
-                    continue
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            parsed = json.loads(text[start : index + 1])
-                        except json.JSONDecodeError:
-                            break
-                        if isinstance(parsed, dict):
-                            return parsed
-                        break
-            start = text.find("{", start + 1)
-        return None
 
     def _build_deliverable_extraction_messages(self, query: str) -> list[Any]:
         prompt = (
@@ -277,7 +405,7 @@ class DatabaoRuntime:
         *,
         llm_config: "LLMConfig" | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
-        debug = {"source": "legacy_fallback", "language": None}
+        debug = {"source": "heuristic_local", "language": None}
         if llm_config is None or not self._trigger_explicit_deliverable_extraction(query):
             return [], debug
 
@@ -302,7 +430,7 @@ class DatabaoRuntime:
         *,
         llm_config: "LLMConfig" | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        debug = {"source": "lexical_fallback", "reason": None}
+        debug = {"source": "lexical_heuristic", "reason": None}
         if llm_config is None:
             return False, debug
         prompt = (
@@ -342,7 +470,10 @@ class DatabaoRuntime:
     def _template_follow_up(self, query: str, missing_clauses: list[str]) -> str:
         if self._looks_like_chinese(query + " " + " ".join(missing_clauses)):
             bullets = "； ".join(missing_clauses)
-            return f"请只基于同一个 dataframe 补充未回答的部分：{bullets}。不要重述整张表。"
+            return (
+                f"请只基于同一个 dataframe 补充未回答的部分：{bullets}。"
+                "不要重述整张表。Do not restate the full table."
+            )
         bullets = "; ".join(missing_clauses)
         return f"Please answer the missing points from the same dataframe only: {bullets}. Do not restate the full table."
 
@@ -382,7 +513,8 @@ class DatabaoRuntime:
         )
 
     def drop_session(self, conversation_id: str) -> None:
-        session = self._sessions.pop(conversation_id, None)
+        with self._session_lock:
+            session = self._sessions.pop(conversation_id, None)
         if session is None:
             return
 
@@ -417,7 +549,7 @@ class DatabaoRuntime:
             prior_turns=history_turns,
         )
         try:
-            result = self._run_turn(session, query, stream_writer=stream_writer)
+            result = self._run_turn(session, query, prior_turns=history_turns, stream_writer=stream_writer)
             return result, self._snapshot(session)
         except Exception as exc:
             fallback_result = self._maybe_retry_with_fallback(
@@ -470,6 +602,24 @@ class DatabaoRuntime:
             if event.get("type") in {"final", "error"}:
                 break
 
+    def _get_session(self, conversation_id: str) -> _DatabaoSession | None:
+        with self._session_lock:
+            return self._sessions.get(conversation_id)
+
+    def _publish_session(
+        self,
+        conversation_id: str,
+        session: _DatabaoSession,
+        *,
+        expected_existing: _DatabaoSession | None,
+    ) -> _DatabaoSession:
+        with self._session_lock:
+            current = self._sessions.get(conversation_id)
+            if current is expected_existing:
+                self._sessions[conversation_id] = session
+                return session
+            return current if current is not None else session
+
     def _ensure_session(
         self,
         conversation_id: str,
@@ -479,7 +629,7 @@ class DatabaoRuntime:
         provider_name: str | None = None,
     ) -> _DatabaoSession:
         signature = self._signature(uploaded_contexts)
-        existing = self._sessions.get(conversation_id)
+        existing = self._get_session(conversation_id)
         target_provider = normalize_provider_name(provider_name or self._settings.llm_provider)
         if existing and existing.uploaded_signature == signature and existing.provider_name == target_provider:
             existing.context_replayed = False
@@ -488,12 +638,12 @@ class DatabaoRuntime:
             return existing
 
         replay_turns = prior_turns or []
-        should_replay = (
+        datasource_rebuilt = (
             existing is not None
             and existing.provider_name == target_provider
             and existing.uploaded_signature != signature
-            and bool(replay_turns)
         )
+        should_replay = datasource_rebuilt and bool(replay_turns)
         session = self._build_session(
             conversation_id,
             uploaded_contexts=uploaded_contexts,
@@ -501,15 +651,19 @@ class DatabaoRuntime:
             context_replayed=should_replay,
             thread_reset_reason=(
                 "datasource_rebuilt_with_history_replay"
-                if existing is not None and existing.provider_name == target_provider and existing.uploaded_signature != signature
-                else ("provider_changed" if existing is not None else None)
+                if should_replay
+                else (
+                    "datasource_rebuilt"
+                    if datasource_rebuilt
+                    else ("provider_changed" if existing is not None else None)
+                )
             ),
             provider_name=provider_name,
         )
         if should_replay:
             self._replay_prior_turns(session, replay_turns)
         if provider_name is None:
-            self._sessions[conversation_id] = session
+            session = self._publish_session(conversation_id, session, expected_existing=existing)
         return session
 
     def _build_session(
@@ -641,35 +795,76 @@ class DatabaoRuntime:
             if stream_writer is not None:
                 thread._writer = previous_writer
 
-    def _run_turn(self, session: _DatabaoSession, query: str, *, stream_writer: Any | None = None) -> DatabaoTurnResult:
+    def _run_turn(
+        self,
+        session: _DatabaoSession,
+        query: str,
+        *,
+        prior_turns: list[ConversationTurn] | None = None,
+        stream_writer: Any | None = None,
+    ) -> DatabaoTurnResult:
         chart_requested = self._has_explicit_chart_intent(query)
         chart_intent = self._extract_chart_intent(query)
+        turn_failure_state: str | None = None
+        failure_reason: str | None = None
+        contract_debug: dict[str, Any] = {}
         with self._streaming_thread_writer(session, stream_writer):
             thread = session.thread.ask(query)
             dataframe = thread.df(rows_limit=200)
-            plot_result, plot_error = self._maybe_collect_plot(thread, query)
-            if plot_result is None and plot_error is None:
-                auto_plot_result = self._auto_visualization_result(thread)
-                if auto_plot_result is not None:
-                    plot_result = auto_plot_result
-                    chart_requested = True
             thread_meta = thread.meta()
+            sql_guardrail_trace = self._extract_sql_guardrail_trace(thread_meta)
+            raw_text = thread.text()
+            turn_failure_state, failure_reason = self._detect_turn_failure_state(
+                text=raw_text,
+                dataframe=dataframe,
+            )
+            if sql_guardrail_trace.get("final_failure_reason"):
+                turn_failure_state = "sql_guardrail_blocked"
+                failure_reason = str(sql_guardrail_trace.get("final_failure_reason"))
+            chart_generation_allowed = turn_failure_state is None
+            if chart_generation_allowed:
+                plot_result, plot_error = self._maybe_collect_plot(thread, query)
+                if plot_result is None and plot_error is None:
+                    auto_plot_result = self._auto_visualization_result(thread)
+                    if auto_plot_result is not None:
+                        plot_result = auto_plot_result
+                        chart_requested = True
+            else:
+                plot_result, plot_error = None, None
             text, completion_validation = self._complete_response(
                 thread,
                 query,
-                thread.text(),
+                raw_text,
                 dataframe,
                 llm_config=session.agent.llm_config,
+                allow_follow_up=chart_generation_allowed,
+                failure_reason=failure_reason,
+            )
+            plot_result, plot_error, contract_debug = self._enforce_chart_contract(
+                thread=thread,
+                query=query,
+                chart_requested=chart_requested and chart_generation_allowed,
+                dataframe=dataframe,
+                plot_result=plot_result,
+                plot_error=plot_error,
+                turn_failure_state=turn_failure_state,
             )
 
         preview = dataframe.head(10).to_dict(orient="records") if dataframe is not None else None
         columns = [str(column) for column in dataframe.columns] if dataframe is not None else None
         row_count = int(len(dataframe)) if dataframe is not None else None
 
+        plot_plan = getattr(plot_result, "chart_plan", None) if plot_result is not None else None
         plot_spec = getattr(plot_result, "spec", None) if plot_result is not None else None
         plot_data_frame = getattr(plot_result, "spec_df", None) if plot_result is not None else None
         plot_data = plot_data_frame.to_dict(orient="records") if plot_data_frame is not None else None
         plot_meta = getattr(plot_result, "meta", None) if plot_result is not None else None
+        if plot_plan is None and isinstance(plot_meta, dict):
+            plot_plan = plot_meta.get("chart_plan") or plot_meta.get("plot_config")
+        if plot_plan is None and plot_result is not None:
+            plot_plan = getattr(plot_result, "plot_config", None)
+        if plot_spec is None and isinstance(plot_plan, dict):
+            plot_spec = dict(plot_plan)
         visualizer_chart_debug = dict(plot_meta.get("chart_debug") or {}) if isinstance(plot_meta, dict) else {}
         visualizer_plot_error = str(plot_meta.get("plot_error")) if isinstance(plot_meta, dict) and plot_meta.get("plot_error") else None
         effective_plot_error = visualizer_plot_error or plot_error
@@ -681,13 +876,20 @@ class DatabaoRuntime:
             plot_result is not None
             and (
                 getattr(plot_result, "plot", None) is not None
+                or plot_plan is not None
                 or (plot_spec is not None and plot_data_frame is not None)
                 or plot_image_base64 is not None
             )
         )
         planner_status = visualizer_chart_debug.get("planner_status")
         upstream_chart_failed = planner_status in {"planning_failed", "schema_parse_failed", "validation_failed", "render_failed"}
+        if chart_requested and upstream_chart_failed and turn_failure_state is None:
+            turn_failure_state = "chart_planner_failed"
+            failure_reason = str(visualizer_chart_debug.get("render_error") or visualizer_chart_debug.get("planner_error") or "Chart planner failed.")
         chart_generated = plot_result is not None and effective_plot_error is None and not upstream_chart_failed
+        if chart_requested and not chart_generated and turn_failure_state is None and effective_plot_error:
+            turn_failure_state = "chart_generation_failed"
+            failure_reason = str(effective_plot_error)
 
         session_provider = getattr(session, "provider_name", None) or self._settings.llm_provider
         resolved = self._resolve_provider_config(session_provider)
@@ -697,9 +899,12 @@ class DatabaoRuntime:
             plot_object = getattr(plot_result, "plot", None)
             if plot_object is not None:
                 chart_renderer = type(plot_object).__name__
+            elif plot_plan is not None:
+                chart_renderer = chart_renderer or "seaborn_chart_plan"
+                chart_type = chart_type or str((plot_plan or {}).get("kind") or "chart_plan")
             elif plot_spec is not None:
-                chart_renderer = chart_renderer or "vega_lite_spec"
-                chart_type = chart_type or str((plot_spec or {}).get("mark") or "vega-lite")
+                chart_renderer = chart_renderer or "serialized_chart_spec"
+                chart_type = chart_type or str((plot_spec or {}).get("mark") or "chart_spec")
 
         chart_artifact_id = self._build_chart_artifact_id(
             query=query,
@@ -729,6 +934,9 @@ class DatabaoRuntime:
                     chart_failure_reason = str(planner_error)
                 else:
                     chart_failure_reason = "chart generation failed upstream"
+            elif turn_failure_state is not None:
+                chart_failure_stage = "blocked_by_turn_failure"
+                chart_failure_reason = failure_reason or "Chart generation blocked because turn failed."
             elif plot_result is None and effective_plot_error is None:
                 chart_failure_stage = "generation_failed"
                 chart_failure_reason = "chart request was detected but no chart artifact was produced"
@@ -742,7 +950,7 @@ class DatabaoRuntime:
         chart_debug = {
             "chart_requested": chart_requested,
             "chart_intent": chart_intent,
-            "chart_generation_called": chart_requested,
+            "chart_generation_called": chart_requested and turn_failure_state is None,
             "chart_generated": chart_generated,
             "chart_renderable": chart_renderable,
             "chart_renderer": chart_renderer,
@@ -771,6 +979,8 @@ class DatabaoRuntime:
             "raw_repair_response": visualizer_chart_debug.get("raw_repair_response"),
             "fallback_blocked": visualizer_chart_debug.get("fallback_blocked"),
             "fallback_reason": visualizer_chart_debug.get("fallback_reason"),
+            "turn_failure_state": turn_failure_state,
+            "failure_reason": failure_reason,
         }
         if visualizer_chart_debug:
             chart_debug.update(visualizer_chart_debug)
@@ -778,37 +988,501 @@ class DatabaoRuntime:
             chart_debug["chart_failure_stage"] = chart_failure_stage
             chart_debug["chart_failure_reason"] = chart_failure_reason
             chart_debug["plot_error"] = effective_plot_error
+        if contract_debug:
+            chart_debug.update(contract_debug)
+
+        if turn_failure_state is not None:
+            completion_validation = self._enforce_failed_completion_validation(
+                completion_validation,
+                failure_reason=failure_reason,
+                chart_requested=chart_requested,
+            )
+            if any(marker in str(text or "").lower() for marker in _PSEUDO_SUCCESS_MARKERS):
+                text = self._failure_response_text(query, failure_reason)
 
         thread_meta = {
             **thread_meta,
             "provider_used": resolved.provider,
             "model_used": resolved.model,
             "chart_debug": chart_debug,
+            "turn_failure_state": turn_failure_state,
+            "failure_reason": failure_reason,
+            "business_result_present": turn_failure_state is None and dataframe is not None and not dataframe.empty,
+            "query_obligations": sql_guardrail_trace.get("query_obligations"),
+            "parsed_sql_summary": sql_guardrail_trace.get("parsed_sql_summary"),
+            "sql_guardrail_report": (sql_guardrail_trace.get("sql_guardrail_reports") or [None])[-1],
+            "execution_validation_report": sql_guardrail_trace.get("execution_validation_report"),
+            "sql_retry_history": sql_guardrail_trace.get("sql_retry_history"),
+            "final_guardrail_status": sql_guardrail_trace.get("final_guardrail_status"),
+            "repair_attempts": sql_guardrail_trace.get("repair_attempts"),
+            "final_failure_reason": sql_guardrail_trace.get("final_failure_reason"),
         }
-        result = DatabaoTurnResult(
-            text=text,
+        turn_id = str(thread_meta.get("turn_id") or uuid4())
+        workspace = self._build_result_workspace(
+            conversation_id=session.conversation_id,
+            turn_id=turn_id,
             dataframe=dataframe,
-            dataframe_preview=preview,
+            preview=preview,
             columns=columns,
             row_count=row_count,
-            provider_used=resolved.provider,
-            model_used=resolved.model,
-            plot_code=getattr(plot_result, "code", None) if plot_result is not None else thread_meta.get("plot_code"),
-            plot_object=plot_result,
+            text=text,
+            plot_result=plot_result,
+            plot_plan=plot_plan,
             plot_spec=plot_spec,
             plot_data=plot_data,
             plot_meta=plot_meta,
             plot_backend=plot_backend,
             plot_kind=plot_kind,
             plot_image_base64=plot_image_base64,
+            plot_error=effective_plot_error,
+            chart_artifact_id=chart_artifact_id,
+            thread_meta=thread_meta,
+            turn_failure_state=turn_failure_state,
+            failure_reason=failure_reason,
+        )
+        recent_turn_metadatas = self._recent_turn_metadata_snapshots(prior_turns)
+        grounded_response = self._build_grounded_response(
+            query=query,
+            workspace=workspace,
+            recent_turn_metadatas=recent_turn_metadatas,
+            use_llm=True,
+            turn_failure_state=turn_failure_state,
+        )
+        workspace_table_artifact = workspace.resolve_artifact(grounded_response.primary_table_artifact_id)
+        workspace_chart_artifact = workspace.resolve_artifact(grounded_response.primary_chart_artifact_id)
+
+        projected_preview = (
+            workspace_table_artifact.dataframe_preview
+            if workspace_table_artifact is not None
+            else preview
+        )
+        projected_columns = (
+            list((workspace_table_artifact.metadata or {}).get("columns") or [])
+            if workspace_table_artifact is not None
+            else (columns or [])
+        )
+        projected_row_count = (
+            (workspace_table_artifact.metadata or {}).get("row_count")
+            if workspace_table_artifact is not None
+            else row_count
+        )
+        projected_plot_plan = workspace_chart_artifact.chart_plan if workspace_chart_artifact is not None else plot_plan
+        projected_plot_spec = workspace_chart_artifact.chart_spec if workspace_chart_artifact is not None else plot_spec
+        projected_plot_data = workspace_chart_artifact.chart_data if workspace_chart_artifact is not None else plot_data
+        projected_plot_meta = workspace_chart_artifact.chart_meta if workspace_chart_artifact is not None else plot_meta
+        projected_plot_backend = (
+            (workspace_chart_artifact.metadata or {}).get("plot_backend")
+            if workspace_chart_artifact is not None
+            else plot_backend
+        )
+        projected_plot_kind = (
+            (workspace_chart_artifact.metadata or {}).get("plot_kind")
+            if workspace_chart_artifact is not None
+            else plot_kind
+        )
+        projected_plot_image_base64 = (
+            (workspace_chart_artifact.metadata or {}).get("plot_image_base64")
+            if workspace_chart_artifact is not None
+            else plot_image_base64
+        )
+        thread_meta = {
+            **thread_meta,
+            "turn_id": turn_id,
+            "result_workspace": workspace.to_dict(),
+            "grounded_response": grounded_response.to_dict(),
+            "primary_artifact_id": grounded_response.primary_table_artifact_id or grounded_response.primary_text_artifact_id,
+            "primary_table_artifact_id": grounded_response.primary_table_artifact_id,
+            "primary_chart_artifact_id": grounded_response.primary_chart_artifact_id,
+            "followup_target_artifact_id": grounded_response.followup_target_artifact_id,
+            "binding_intent": grounded_response.render_payload.get("binding_intent"),
+            "binding_bundle": grounded_response.render_payload.get("binding_bundle"),
+            "binding_decisions": grounded_response.render_payload.get("binding_decisions"),
+            "decision_mode": grounded_response.render_payload.get("decision_mode"),
+            "llm_used": grounded_response.render_payload.get("llm_used", False),
+            "turn_failure_state": turn_failure_state,
+            "failure_reason": failure_reason,
+            "business_result_present": turn_failure_state is None and dataframe is not None and not dataframe.empty,
+        }
+        result = DatabaoTurnResult(
+            text=text,
+            dataframe=dataframe,
+            dataframe_preview=projected_preview,
+            columns=projected_columns,
+            row_count=projected_row_count,
+            provider_used=resolved.provider,
+            model_used=resolved.model,
+            plot_code=getattr(plot_result, "code", None) if plot_result is not None else thread_meta.get("plot_code"),
+            plot_object=plot_result,
+            plot_plan=projected_plot_plan,
+            plot_spec=projected_plot_spec,
+            plot_data=projected_plot_data,
+            plot_meta=projected_plot_meta,
+            plot_backend=projected_plot_backend,
+            plot_kind=projected_plot_kind,
+            plot_image_base64=projected_plot_image_base64,
             plot_image_mime_type=plot_image_mime_type,
             plot_error=effective_plot_error,
             chart_debug=chart_debug,
             completion_validation=completion_validation,
             thread_meta=thread_meta,
+            result_workspace=workspace,
+            grounded_response=grounded_response,
+            primary_artifact_id=grounded_response.primary_table_artifact_id or grounded_response.primary_text_artifact_id,
+            primary_table_artifact_id=grounded_response.primary_table_artifact_id,
+            primary_chart_artifact_id=grounded_response.primary_chart_artifact_id,
+            followup_target_artifact_id=grounded_response.followup_target_artifact_id,
+            binding_intent=grounded_response.render_payload.get("binding_intent"),
+            binding_bundle=grounded_response.render_payload.get("binding_bundle"),
+            binding_decisions=grounded_response.render_payload.get("binding_decisions"),
+            decision_mode=grounded_response.render_payload.get("decision_mode"),
+            llm_used=bool(grounded_response.render_payload.get("llm_used", False)),
+            turn_failure_state=turn_failure_state,
+            failure_reason=failure_reason,
+            business_result_present=turn_failure_state is None and dataframe is not None and not dataframe.empty,
             used_databao=True,
         )
         return result
+
+    @staticmethod
+    def _infer_dataframe_artifact_type(
+        dataframe: pd.DataFrame | None,
+        thread_meta: dict[str, Any],
+        plot_meta: dict[str, Any] | None,
+    ) -> str:
+        if dataframe is None:
+            return "filtered_df"
+        lowered_keys = " ".join(str(key).lower() for key in (thread_meta or {}).keys())
+        lowered_meta = json.dumps(plot_meta or {}, default=str).lower()
+        aggregation_markers = ("group", "aggregate", "aggregation", "count", "mean", "sum", "avg")
+        if any(marker in lowered_keys or marker in lowered_meta for marker in aggregation_markers):
+            return "grouped_df"
+        if isinstance(dataframe.columns, pd.Index) and any(str(column).lower().startswith(("avg_", "sum_", "count_")) for column in dataframe.columns):
+            return "grouped_df"
+        return "filtered_df"
+
+    @staticmethod
+    def _maybe_extract_scalar_artifact(
+        dataframe: pd.DataFrame | None,
+        *,
+        parent_artifact_id: str | None,
+    ) -> ResultArtifact | None:
+        if dataframe is None or dataframe.shape != (1, 1):
+            return None
+        value = dataframe.iat[0, 0]
+        return ResultArtifact(
+            artifact_id=f"scalar:{parent_artifact_id or 'result'}",
+            artifact_type="scalar",
+            name="Scalar Result",
+            parent_artifact_id=parent_artifact_id,
+            created_by_step="turn_result",
+            scalar_value=value,
+            metadata={"source": "dataframe_cell"},
+        )
+
+    @staticmethod
+    def _build_chart_render_payload(
+        plot_result: Any | None,
+        *,
+        plot_plan: dict[str, Any] | None,
+        plot_spec: dict[str, Any] | None,
+        plot_data: list[dict[str, Any]] | None,
+        plot_meta: dict[str, Any] | None,
+        plot_backend: str | None,
+        plot_kind: str | None,
+        plot_image_base64: str | None,
+        plot_error: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        runtime_handles: dict[str, Any] = {}
+        render_kind = "unknown"
+        heavy_runtime_object = None
+        plot_attr = getattr(plot_result, "plot", None) if plot_result is not None else None
+        serializable_plan = plot_plan
+
+        if plot_image_base64 is not None:
+            render_kind = "image_base64"
+        elif serializable_plan is not None:
+            render_kind = "chart_plan"
+        elif isinstance(plot_attr, Axes):
+            render_kind = "matplotlib_axes"
+            heavy_runtime_object = plot_attr
+        elif isinstance(plot_attr, Figure):
+            render_kind = "matplotlib_figure"
+            heavy_runtime_object = plot_attr
+        elif plot_attr is not None:
+            render_kind = "plot_attr"
+            heavy_runtime_object = plot_attr
+        elif isinstance(plot_result, Axes):
+            render_kind = "matplotlib_axes"
+            heavy_runtime_object = plot_result
+        elif isinstance(plot_result, Figure):
+            render_kind = "matplotlib_figure"
+            heavy_runtime_object = plot_result
+        elif plot_result is not None:
+            render_kind = "runtime_handle"
+            heavy_runtime_object = plot_result
+
+        if plot_result is not None:
+            runtime_handles["plot_result"] = plot_result
+        if heavy_runtime_object is not None:
+            runtime_handles["chart_runtime_object"] = heavy_runtime_object
+
+        render_payload = {
+            "render_kind": render_kind,
+            "chart_plan": serializable_plan,
+            "chart_spec": None,
+            "chart_data": plot_data,
+            "chart_meta": plot_meta,
+            "plot_image_base64": plot_image_base64,
+            "plot_backend": plot_backend,
+            "plot_kind": plot_kind,
+            "plot_error": plot_error,
+            "has_heavy_runtime_object": bool(runtime_handles),
+        }
+        return render_payload, runtime_handles
+
+    def _build_result_workspace(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        dataframe: pd.DataFrame | None,
+        preview: list[dict[str, Any]] | None,
+        columns: list[str] | None,
+        row_count: int | None,
+        text: str,
+        plot_result: Any | None,
+        plot_plan: dict[str, Any] | None,
+        plot_spec: dict[str, Any] | None,
+        plot_data: list[dict[str, Any]] | None,
+        plot_meta: dict[str, Any] | None,
+        plot_backend: str | None,
+        plot_kind: str | None,
+        plot_image_base64: str | None,
+        plot_error: str | None,
+        chart_artifact_id: str,
+        thread_meta: dict[str, Any],
+        turn_failure_state: str | None,
+        failure_reason: str | None,
+    ) -> ResultWorkspace:
+        workspace = ResultWorkspace(conversation_id=conversation_id, turn_id=turn_id)
+        dataframe_artifact_id: str | None = None
+        dataframe_purpose = "diagnostic" if turn_failure_state is not None else "business_result"
+        if dataframe is not None:
+            dataframe_artifact_type = self._infer_dataframe_artifact_type(dataframe, thread_meta, plot_meta)
+            dataframe_artifact = workspace.register_artifact(
+                ResultArtifact(
+                    artifact_id=f"{dataframe_artifact_type}:{turn_id}",
+                    artifact_type=dataframe_artifact_type,
+                    name="Query Result DataFrame",
+                    created_by_step="turn_result",
+                    dataframe=dataframe,
+                    dataframe_preview=preview,
+                    metadata={
+                        "columns": list(columns or []),
+                        "row_count": row_count,
+                        "turn_failure_state": turn_failure_state,
+                        "failure_reason": failure_reason,
+                    },
+                    artifact_purpose=dataframe_purpose,
+                )
+            )
+            dataframe_artifact_id = dataframe_artifact.artifact_id
+
+        text_artifact = workspace.register_artifact(
+            ResultArtifact(
+                artifact_id=f"text_answer:{turn_id}",
+                artifact_type="text_answer",
+                name="Answer Text",
+                parent_artifact_id=dataframe_artifact_id,
+                created_by_step="answer_completion",
+                text_value=text,
+                metadata={"length": len(text), "turn_failure_state": turn_failure_state, "failure_reason": failure_reason},
+                artifact_purpose="diagnostic" if turn_failure_state is not None else "business_result",
+            )
+        )
+
+        if plot_result is not None or plot_plan is not None or plot_spec is not None or plot_image_base64 is not None:
+            render_payload, runtime_handles = self._build_chart_render_payload(
+                plot_result,
+                plot_plan=plot_plan,
+                plot_spec=plot_spec,
+                plot_data=plot_data,
+                plot_meta=plot_meta,
+                plot_backend=plot_backend,
+                plot_kind=plot_kind,
+                plot_image_base64=plot_image_base64,
+                plot_error=plot_error,
+            )
+            workspace.register_artifact(
+                ResultArtifact(
+                    artifact_id=f"chart:{chart_artifact_id}",
+                    artifact_type="chart",
+                    name="Chart Result",
+                    parent_artifact_id=dataframe_artifact_id,
+                    created_by_step="chart_generation",
+                    chart_plan=plot_plan,
+                    chart_spec=plot_spec,
+                    chart_data=plot_data,
+                    chart_meta=plot_meta,
+                    render_payload=render_payload,
+                    runtime_handles=runtime_handles,
+                    metadata={
+                        "plot_backend": plot_backend,
+                        "plot_kind": plot_kind,
+                        "plot_image_base64": plot_image_base64,
+                        "plot_error": plot_error,
+                    },
+                    artifact_purpose="business_result" if turn_failure_state is None else "diagnostic",
+                )
+            )
+
+        scalar_artifact = self._maybe_extract_scalar_artifact(dataframe, parent_artifact_id=dataframe_artifact_id)
+        if scalar_artifact is not None:
+            workspace.register_artifact(scalar_artifact)
+
+        if workspace.root_artifact_id is None:
+            workspace.root_artifact_id = text_artifact.artifact_id
+        return workspace
+
+    @staticmethod
+    def _recent_turn_metadata_snapshots(prior_turns: list[ConversationTurn] | None) -> list[dict[str, Any]]:
+        snapshots: list[dict[str, Any]] = []
+        for turn in prior_turns or []:
+            metadata = dict(getattr(turn, "metadata", None) or {})
+            if not metadata:
+                continue
+            snapshots.append(
+                {
+                    "result_workspace": metadata.get("result_workspace"),
+                    "grounded_response": metadata.get("grounded_response"),
+                    "primary_artifact_id": metadata.get("primary_artifact_id"),
+                    "primary_table_artifact_id": metadata.get("primary_table_artifact_id"),
+                    "primary_chart_artifact_id": metadata.get("primary_chart_artifact_id"),
+                    "followup_target_artifact_id": metadata.get("followup_target_artifact_id"),
+                    "binding_intent": metadata.get("binding_intent"),
+                    "binding_bundle": metadata.get("binding_bundle"),
+                    "binding_decisions": metadata.get("binding_decisions"),
+                    "decision_mode": metadata.get("decision_mode"),
+                    "llm_used": metadata.get("llm_used", False),
+                }
+            )
+        return snapshots
+
+    def _build_grounded_response(
+        self,
+        *,
+        query: str,
+        workspace: ResultWorkspace,
+        recent_turn_metadatas: list[dict[str, Any]] | None = None,
+        use_llm: bool = True,
+        turn_failure_state: str | None = None,
+    ) -> GroundedResponse:
+        if turn_failure_state:
+            text_artifact = workspace.latest("text_answer")
+            primary_text = text_artifact.artifact_id if text_artifact is not None else None
+            available_actions_by_artifact = {
+                artifact.artifact_id: list(artifact.available_actions)
+                for artifact in workspace.artifacts_by_id.values()
+            }
+            referenced_ids = [artifact_id for artifact_id in (primary_text,) if artifact_id is not None]
+            return GroundedResponse(
+                primary_text_artifact_id=primary_text,
+                primary_table_artifact_id=None,
+                primary_chart_artifact_id=None,
+                primary_explain_artifact_id=primary_text,
+                referenced_artifact_ids=referenced_ids,
+                followup_target_artifact_id=primary_text,
+                available_actions_by_artifact=available_actions_by_artifact,
+                render_payload={
+                    "turn_failure_state": turn_failure_state,
+                    "decision_mode": "deterministic",
+                    "llm_used": False,
+                },
+            )
+        binding_intent = parse_binding_intent(query)
+        binding_intent = enrich_binding_intent_with_llm(binding_intent, settings=self._settings, use_llm=use_llm)
+        binding_bundle = resolve_binding_bundle(
+            workspace,
+            query=query,
+            recent_turn_metadatas=recent_turn_metadatas,
+            binding_intent=binding_intent,
+            use_llm=use_llm,
+            llm_settings=self._settings,
+        )
+        primary_text = binding_bundle.text_target or (workspace.latest("text_answer").artifact_id if workspace.latest("text_answer") is not None else None)
+        primary_table = binding_bundle.table_target
+        table_artifact = workspace.resolve_artifact(primary_table)
+        if table_artifact is None or not table_artifact.is_dataframe_like():
+            for artifact_type in ("grouped_df", "filtered_df", "raw_df"):
+                artifact = workspace.latest(artifact_type)
+                if artifact is not None:
+                    primary_table = artifact.artifact_id
+                    break
+        primary_chart = binding_bundle.chart_target
+        chart_artifact = workspace.resolve_artifact(primary_chart)
+        if chart_artifact is None or not chart_artifact.is_chart_like():
+            latest_chart = workspace.latest("chart")
+            primary_chart = latest_chart.artifact_id if latest_chart is not None else primary_chart
+        primary_explain = binding_bundle.explain_target
+        followup_target = binding_bundle.followup_target
+        available_actions_by_artifact = {
+            artifact.artifact_id: list(artifact.available_actions)
+            for artifact in workspace.artifacts_by_id.values()
+        }
+        referenced_ids = [
+            artifact_id
+            for artifact_id in (
+                primary_text,
+                primary_table,
+                primary_chart,
+                primary_explain,
+                followup_target,
+            )
+            if artifact_id is not None
+        ]
+        decision_modes = {
+            action: decision.decision_mode
+            for action, decision in binding_bundle.decisions_by_action.items()
+        }
+        llm_used = any(decision.llm_used for decision in binding_bundle.decisions_by_action.values())
+        decision_mode = next(
+            (
+                mode
+                for mode in (
+                    decision_modes.get("followup"),
+                    decision_modes.get("explain"),
+                    decision_modes.get("show_chart"),
+                    decision_modes.get("show_table"),
+                    decision_modes.get("answer_text"),
+                )
+                if mode
+            ),
+            "deterministic",
+        )
+        chart_artifact = workspace.resolve_artifact(primary_chart)
+        return GroundedResponse(
+            primary_text_artifact_id=primary_text,
+            primary_table_artifact_id=primary_table,
+            primary_chart_artifact_id=primary_chart,
+            primary_explain_artifact_id=primary_explain,
+            referenced_artifact_ids=referenced_ids,
+            followup_target_artifact_id=followup_target,
+            available_actions_by_artifact=available_actions_by_artifact,
+            render_payload={
+                "primary_text_artifact_id": primary_text,
+                "primary_table_artifact_id": primary_table,
+                "primary_chart_artifact_id": primary_chart,
+                "primary_chart_render_payload": dict(chart_artifact.render_payload) if chart_artifact is not None else {},
+                "binding_intent": binding_intent.to_dict(),
+                "binding_bundle": binding_bundle.to_dict(),
+                "binding_decisions": {
+                    action: decision.to_dict()
+                    for action, decision in binding_bundle.decisions_by_action.items()
+                },
+                "decision_mode": decision_mode,
+                "llm_used": llm_used,
+            },
+        )
 
     def _maybe_retry_with_fallback(
         self,
@@ -838,7 +1512,12 @@ class DatabaoRuntime:
             provider_name=fallback_provider,
         )
         try:
-            result = self._run_turn(fallback_session, query, stream_writer=stream_writer)
+            result = self._run_turn(
+                fallback_session,
+                query,
+                prior_turns=_prior_turns,
+                stream_writer=stream_writer,
+            )
         except Exception:
             return None
 
@@ -877,10 +1556,11 @@ class DatabaoRuntime:
             "503",
             "502",
             "504",
-            "deepseek",
-            "ollama",
         )
-        return any(marker in message for marker in fallback_markers)
+        infrastructure_prefixes = ("connection", "network", "request", "transport", "timeout", "temporary", "service unavailable")
+        if not any(marker in message for marker in fallback_markers):
+            return False
+        return any(prefix in message for prefix in infrastructure_prefixes) or any(code in message for code in ("429", "502", "503", "504"))
 
     @staticmethod
     def _provider_error_reason(exc: Exception) -> str:
@@ -889,7 +1569,7 @@ class DatabaoRuntime:
     @staticmethod
     def _explicit_chart_request_marker(query: str) -> str | None:
         lowered = query.lower()
-        for marker in CHART_INTENT_MARKERS:
+        for marker in EXPLICIT_CHART_REQUEST_MARKERS:
             if re.search(r"[a-z]", marker):
                 pattern = r"(?<![a-z])" + re.escape(marker).replace(r"\ ", r"\s+") + r"(?![a-z])"
                 if re.search(pattern, lowered):
@@ -1063,9 +1743,9 @@ class DatabaoRuntime:
         if backend is not None:
             return str(backend)
         if hasattr(plot_result, "spec") and hasattr(plot_result, "spec_df"):
-            return "vega"
+            return "chart_spec"
         if hasattr(plot_result, "png_bytes") or hasattr(plot_result, "png_base64") or hasattr(plot_result, "image"):
-            return "seaborn"
+            return "matplotlib"
         return type(plot_result).__name__
 
     @staticmethod
@@ -1123,6 +1803,112 @@ class DatabaoRuntime:
         except Exception as exc:
             return None, str(exc)
 
+    def _enforce_chart_contract(
+        self,
+        *,
+        thread: Any,
+        query: str,
+        chart_requested: bool,
+        dataframe: pd.DataFrame | None,
+        plot_result: Any | None,
+        plot_error: str | None,
+        turn_failure_state: str | None,
+    ) -> tuple[Any | None, str | None, dict[str, Any]]:
+        contract_debug: dict[str, Any] = {
+            "chart_contract": None,
+            "chart_contract_validation": None,
+            "chart_contract_repair_attempted": False,
+            "chart_contract_repair_success": False,
+        }
+        if not chart_requested:
+            return plot_result, plot_error, contract_debug
+        if plot_error:
+            contract_debug["chart_contract_skipped"] = "upstream_plot_error"
+            return plot_result, plot_error, contract_debug
+        plot_meta = getattr(plot_result, "meta", None) if plot_result is not None else None
+        planner_status = None
+        if isinstance(plot_meta, dict):
+            planner_status = str((plot_meta.get("chart_debug") or {}).get("planner_status") or "")
+            if plot_meta.get("plot_error"):
+                contract_debug["chart_contract_skipped"] = "upstream_plot_meta_error"
+                return plot_result, plot_error, contract_debug
+        if planner_status in {"planning_failed", "schema_parse_failed", "validation_failed", "render_failed"}:
+            contract_debug["chart_contract_skipped"] = "upstream_planner_failure"
+            return plot_result, plot_error, contract_debug
+
+        columns = [str(column) for column in dataframe.columns] if dataframe is not None else []
+        contract = build_chart_request_contract(query, chart_requested=chart_requested)
+        contract_debug["chart_contract"] = contract.to_dict()
+        if not any(
+            [
+                contract.required_fields,
+                contract.requested_kind,
+                contract.requested_orientation,
+                contract.requested_hue,
+                contract.requested_stack_mode,
+                contract.requested_normalize_mode,
+            ]
+        ):
+            contract_debug["chart_contract_skipped"] = "no_explicit_chart_contract"
+            return plot_result, plot_error, contract_debug
+
+        plot_plan = getattr(plot_result, "chart_plan", None) if plot_result is not None else None
+        plot_spec = getattr(plot_result, "spec", None) if plot_result is not None else None
+        if plot_plan is None and plot_result is not None:
+            plot_plan = getattr(plot_result, "plot_config", None)
+        if plot_plan is None and isinstance(plot_meta, dict):
+            plot_plan = plot_meta.get("chart_plan") or plot_meta.get("plot_config")
+        source_purpose = "diagnostic" if (turn_failure_state is not None or self._is_diagnostic_dataframe(dataframe)) else "business_result"
+        validation = validate_chart_contract(
+            contract=contract,
+            dataframe_columns=columns,
+            chart_plan=plot_plan,
+            chart_spec=plot_spec,
+            artifact_purpose=source_purpose,
+        )
+        contract_debug["chart_contract_validation"] = validation.to_dict()
+        if validation.status != "mismatch":
+            return plot_result, plot_error, contract_debug
+
+        if turn_failure_state is not None:
+            reason = "; ".join(validation.mismatch_reasons) or "chart blocked by failed turn state"
+            return None, f"chart_contract_mismatch: {reason}", contract_debug
+
+        if not validation.repairable:
+            reason = "; ".join(validation.mismatch_reasons) or "chart contract mismatch"
+            return None, f"chart_contract_mismatch: {reason}", contract_debug
+
+        repair_prompt = build_controlled_repair_prompt(contract, validation.resolved_fields)
+        contract_debug["chart_contract_repair_attempted"] = True
+        contract_debug["chart_contract_repair_prompt"] = repair_prompt
+        try:
+            repaired_plot = thread.plot(repair_prompt)
+        except Exception as exc:
+            reason = "; ".join(validation.mismatch_reasons) or "chart contract mismatch"
+            return None, f"chart_contract_mismatch: {reason}; repair_error: {exc}", contract_debug
+
+        repaired_plan = getattr(repaired_plot, "chart_plan", None) if repaired_plot is not None else None
+        repaired_spec = getattr(repaired_plot, "spec", None) if repaired_plot is not None else None
+        if repaired_plan is None and repaired_plot is not None:
+            repaired_plan = getattr(repaired_plot, "plot_config", None)
+        repaired_meta = getattr(repaired_plot, "meta", None) if repaired_plot is not None else None
+        if repaired_plan is None and isinstance(repaired_meta, dict):
+            repaired_plan = repaired_meta.get("chart_plan") or repaired_meta.get("plot_config")
+        repaired_validation = validate_chart_contract(
+            contract=contract,
+            dataframe_columns=columns,
+            chart_plan=repaired_plan,
+            chart_spec=repaired_spec,
+            artifact_purpose=source_purpose,
+        )
+        contract_debug["chart_contract_repair_validation"] = repaired_validation.to_dict()
+        if repaired_validation.status == "matched":
+            contract_debug["chart_contract_repair_success"] = True
+            return repaired_plot, None, contract_debug
+
+        reason = "; ".join(repaired_validation.mismatch_reasons) or "chart contract mismatch"
+        return None, f"chart_contract_mismatch: {reason}", contract_debug
+
     def _complete_response(
         self,
         thread: Any,
@@ -1131,28 +1917,43 @@ class DatabaoRuntime:
         dataframe: pd.DataFrame | None,
         *,
         llm_config: "LLMConfig" | None = None,
+        allow_follow_up: bool = True,
+        failure_reason: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         clauses, extraction_debug = self._extract_explicit_deliverables(query, llm_config=llm_config)
         validation: dict[str, Any] = {
             "explicit_deliverables": clauses,
+            "requested_deliverables": clauses,
+            "satisfied_deliverables": [],
             "missing_deliverables": [],
             "supplement_added": False,
             "deliverable_extraction_source": extraction_debug.get("source"),
             "coverage_judgement_source": None,
             "follow_up_source": None,
+            "status": "skipped",
         }
         if extraction_debug.get("error"):
             validation["deliverable_extraction_error"] = extraction_debug["error"]
+        if failure_reason:
+            validation["failure_reason"] = failure_reason
+            validation["status"] = "failed"
+            validation["supplement_added"] = False
+            return self._failure_response_text(query, failure_reason), validation
 
         if not clauses and dataframe is not None and not dataframe.empty:
             clauses, fallback_debug = self._extract_explicit_deliverables(query)
             validation["explicit_deliverables"] = clauses
-            validation["deliverable_extraction_source"] = fallback_debug.get("source", "legacy_fallback")
+            validation["requested_deliverables"] = clauses
+            validation["deliverable_extraction_source"] = fallback_debug.get("source", "heuristic_local")
 
         if not clauses or dataframe is None or dataframe.empty:
+            if clauses and (dataframe is None or dataframe.empty):
+                validation["missing_deliverables"] = list(clauses)
+                validation["status"] = "failed"
             return text, validation
 
         missing: list[str] = []
+        satisfied: list[str] = []
         coverage_reasons: list[str] = []
         for clause in clauses:
             covered, judge_debug = self._response_covers_clause(
@@ -1166,14 +1967,23 @@ class DatabaoRuntime:
                 coverage_reasons.append(str(judge_debug["reason"]))
             if not covered:
                 missing.append(clause)
+            else:
+                satisfied.append(clause)
         validation["missing_deliverables"] = missing
+        validation["satisfied_deliverables"] = satisfied
         if coverage_reasons:
             validation["coverage_judgement_reasons"] = coverage_reasons
         if not missing:
+            validation["status"] = "satisfied"
+            return text, validation
+        if not allow_follow_up:
+            validation["status"] = "failed"
+            validation["follow_up_error"] = "Follow-up supplement disabled due to turn failure state."
             return text, validation
 
         follow_up = self._build_follow_up(query, missing, llm_config=llm_config)
         if follow_up is None:
+            validation["status"] = "failed"
             return text, validation
 
         try:
@@ -1181,10 +1991,12 @@ class DatabaoRuntime:
             follow_up_text = follow_up_thread.text().strip()
         except Exception as exc:
             validation["follow_up_error"] = str(exc)
+            validation["status"] = "failed"
             return text, validation
 
         if not follow_up_text:
             validation["follow_up_error"] = "Follow-up response was empty."
+            validation["status"] = "failed"
             return text, validation
 
         combined = text.rstrip()
@@ -1194,6 +2006,7 @@ class DatabaoRuntime:
         validation["supplement_added"] = True
         validation["follow_up_query"] = follow_up
         validation["follow_up_source"] = "llm" if llm_config is not None else "template"
+        validation["status"] = "supplemented"
         return combined, validation
 
     def _extract_explicit_deliverables(
@@ -1203,7 +2016,7 @@ class DatabaoRuntime:
         llm_config: "LLMConfig" | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         debug: dict[str, Any] = {
-            "source": "legacy_fallback",
+            "source": "heuristic_local",
             "language": "zh" if self._looks_like_chinese(query) else "en",
         }
 
@@ -1238,6 +2051,18 @@ class DatabaoRuntime:
         def _is_meaningful_deliverable(text: str) -> bool:
             candidate = self._normalize_whitespace(text)
             if not candidate:
+                return False
+            lowered = candidate.lower()
+            instruction_only_markers = {
+                "你最终至少要回答",
+                "最终至少要回答",
+                "请回答以下问题",
+                "请回答以下",
+                "answer the following",
+                "answer the following explicit deliverables",
+                "explicit deliverables",
+            }
+            if lowered in instruction_only_markers:
                 return False
             if re.fullmatch(r"[\W_：:，,；;。.!！？、\-•*]+", candidate):
                 return False
@@ -1287,7 +2112,7 @@ class DatabaoRuntime:
             matched = clause.strip().lower() in text.lower()
             judge_debug.update(
                 {
-                    "source": "lexical_fallback",
+                    "source": "lexical_heuristic",
                     "reason": "Exact substring match" if matched else "No significant terms found",
                 }
             )
@@ -1299,7 +2124,7 @@ class DatabaoRuntime:
         matched = hits >= required_hits
         judge_debug.update(
             {
-                "source": "lexical_fallback",
+                "source": "lexical_heuristic",
                 "reason": f"Matched {hits}/{len(clause_terms)} significant terms",
             }
         )

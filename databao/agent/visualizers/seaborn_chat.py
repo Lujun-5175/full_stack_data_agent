@@ -4,13 +4,12 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 from typing import Any, Literal
 
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg", force=True)
-from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from PIL import Image
@@ -22,44 +21,39 @@ from databao.agent.core.visualizer import HistoryMode
 from databao.agent.executors.llm import call_model_with_retry
 from databao.agent.visualizers.chart_contract import ChartPlan
 from databao.agent.visualizers.chart_planner import ChartPlanningError, plan_chart_request
+from databao.agent.visualizers.chart_registry import (
+    canonicalize_chart_kind,
+    chart_kind_aliases,
+    supported_chart_kinds,
+)
+from full_stack_data_agent.utils.json_extract import extract_first_json_object
+from full_stack_data_agent.utils.pandas_types import is_categorical_dtype, is_datetime64tz_dtype
 
 logger = logging.getLogger(__name__)
 
+_MATPLOTLIB_BACKEND_READY = False
+
+
+def _ensure_matplotlib_backend() -> None:
+    global _MATPLOTLIB_BACKEND_READY
+    if _MATPLOTLIB_BACKEND_READY:
+        return
+    if "MPLBACKEND" not in os.environ:
+        matplotlib.use("Agg", force=False)
+    _MATPLOTLIB_BACKEND_READY = True
+
+
+from matplotlib import pyplot as plt
+
+
 try:  # optional dependency
     import seaborn as sns
-except Exception:  # pragma: no cover
+except (ImportError, ModuleNotFoundError, OSError):  # pragma: no cover
     sns = None
 
 
-_CHART_KINDS = (
-    "histogram",
-    "countplot",
-    "barplot",
-    "lineplot",
-    "scatterplot",
-    "boxplot",
-    "violinplot",
-    "swarmplot",
-    "stripplot",
-    "jointplot",
-    "pairplot",
-    "heatmap",
-)
-
-_CHART_KIND_ALIASES: dict[str, tuple[str, ...]] = {
-    "histogram": ("histogram", "直方图", "histogram chart", "histogram plot"),
-    "countplot": ("countplot", "count plot", "计数图", "频数图"),
-    "barplot": ("grouped bar chart", "grouped bar plot", "barplot", "bar plot", "bar chart", "柱状图", "条形图", "分组柱状图"),
-    "lineplot": ("lineplot", "line plot", "line chart", "折线图"),
-    "scatterplot": ("scatterplot", "scatter plot", "散点图"),
-    "boxplot": ("boxplot", "box plot", "箱线图", "盒图"),
-    "violinplot": ("violinplot", "violin plot", "小提琴图"),
-    "swarmplot": ("swarmplot", "swarm plot", "蜂群图"),
-    "stripplot": ("stripplot", "strip plot", "条带图"),
-    "jointplot": ("jointplot", "joint plot", "联合图"),
-    "pairplot": ("pairplot", "pair plot", "scatter matrix", "成对图"),
-    "heatmap": ("heatmap", "heat map", "热力图", "相关矩阵"),
-}
+_CHART_KINDS = supported_chart_kinds()
+_CHART_KIND_ALIASES = chart_kind_aliases()
 
 _REQUEST_FIELD_LABELS = {
     "x": ("x", "x-axis", "横轴"),
@@ -81,14 +75,14 @@ def _instruction_request_slice(request: str) -> str:
 
 
 def _is_dt(series: pd.Series) -> bool:
-    return pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_datetime64tz_dtype(series)
+    return pd.api.types.is_datetime64_any_dtype(series) or is_datetime64tz_dtype(series)
 
 
 def _is_cat(series: pd.Series) -> bool:
     return bool(
         pd.api.types.is_object_dtype(series)
         or pd.api.types.is_string_dtype(series)
-        or pd.api.types.is_categorical_dtype(series)
+        or is_categorical_dtype(series)
         or pd.api.types.is_bool_dtype(series)
     )
 
@@ -132,44 +126,52 @@ def _message_text(message: Any) -> str:
     return str(content)
 
 
-def _extract_first_json_object(text: str) -> str | None:
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-                continue
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : index + 1]
-        start = text.find("{", start + 1)
-    return None
-
-
 def _safe_json_loads(text: str) -> dict[str, Any] | None:
-    candidate = _extract_first_json_object(text)
-    if candidate is None:
-        return None
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    return extract_first_json_object(text)
+
+
+def _make_unique_column_labels(columns: list[Any]) -> list[Any]:
+    seen: dict[Any, int] = {}
+    used: set[Any] = set()
+    unique: list[Any] = []
+    for column in columns:
+        count = seen.get(column, 0)
+        if count == 0 and column not in used:
+            unique.append(column)
+            seen[column] = 1
+            used.add(column)
+            continue
+
+        suffix = count
+        candidate: Any = f"{column}__dup{suffix}"
+        while candidate in used:
+            suffix += 1
+            candidate = f"{column}__dup{suffix}"
+        unique.append(candidate)
+        seen[column] = count + 1
+        used.add(candidate)
+    return unique
+
+
+def _dedupe_dataframe_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if df.columns.is_unique:
+        return df, {"duplicate_columns": [], "renamed_columns": {}}
+
+    duplicate_columns: list[str] = []
+    seen: set[Any] = set()
+    for column in df.columns:
+        if column in seen and str(column) not in duplicate_columns:
+            duplicate_columns.append(str(column))
+        seen.add(column)
+
+    deduped = df.copy()
+    deduped.columns = _make_unique_column_labels(list(deduped.columns))
+    renamed_columns = {
+        str(original): str(new)
+        for original, new in zip(df.columns, deduped.columns, strict=False)
+        if original != new
+    }
+    return deduped, {"duplicate_columns": duplicate_columns, "renamed_columns": renamed_columns}
 
 
 class SeabornChatResult(VisualisationResult):
@@ -177,6 +179,7 @@ class SeabornChatResult(VisualisationResult):
     kind: str | None = None
     dataframe: pd.DataFrame | None = None
     plot_config: dict[str, Any] = Field(default_factory=dict)
+    chart_plan: dict[str, Any] = Field(default_factory=dict)
 
     def figure(self) -> Any | None:
         return _plot_like(self.plot)
@@ -229,6 +232,10 @@ class SeabornChatVisualizer(Visualizer):
         return _message_text(response)
 
     @staticmethod
+    def _prepare_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+        return _dedupe_dataframe_columns(df)
+
+    @staticmethod
     def _planner_sample_values(df: pd.DataFrame, limit: int = 5) -> dict[str, list[Any]]:
         sample: dict[str, list[Any]] = {}
         for column in df.columns:
@@ -252,7 +259,7 @@ class SeabornChatVisualizer(Visualizer):
                     continue
                 pattern = r"(?<![a-z])" + re.escape(alias_lower).replace(r"\ ", r"\s+") + r"(?![a-z])"
                 if re.search(pattern, lowered):
-                    return kind
+                    return str(canonicalize_chart_kind(kind))
         return None
 
     @staticmethod
@@ -445,15 +452,22 @@ class SeabornChatVisualizer(Visualizer):
         )
         return planned, planning_error
 
-    def _validate_chart_plan(self, request: str, df: pd.DataFrame, plan: ChartPlan) -> list[str]:
+    def _validate_chart_plan(
+        self,
+        request: str,
+        df: pd.DataFrame,
+        plan: ChartPlan,
+        *,
+        explicit_fields: dict[str, Any] | None = None,
+    ) -> list[str]:
         errors: list[str] = []
         profile = self._profile(df)
-        explicit_fields = self._extract_explicit_field_constraints(request, df)
+        explicit_fields = dict(explicit_fields or self._extract_explicit_field_constraints(request, df))
         explicit_kind = explicit_fields.get("kind")
         lowered_request = _clean(_instruction_request_slice(request))
         numeric_columns = set(profile["numeric"])
         categorical_columns = set(profile["categorical"] + profile["boolean"])
-        allowed_contract_kinds = {"barplot", "lineplot", "scatterplot", "boxplot", "histplot", "countplot"}
+        allowed_contract_kinds = set(supported_chart_kinds())
 
         if plan.kind not in allowed_contract_kinds:
             errors.append(f"Invalid chart kind: {plan.kind}")
@@ -581,11 +595,11 @@ class SeabornChatVisualizer(Visualizer):
                         errors.append("vertical barplot x should be categorical or low-cardinality.")
                     if plan.y is not None:
                         _ensure_numeric(plan.y, label="y")
-        elif plan.kind == "histplot":
+        elif plan.kind == "histogram":
             if plan.x is None:
-                errors.append("histplot requires x.")
+                errors.append("histogram requires x.")
             if plan.y is not None:
-                errors.append("histplot should not specify y.")
+                errors.append("histogram should not specify y.")
             if plan.x is not None and plan.x in df.columns:
                 series = df[plan.x]
                 if not (
@@ -595,7 +609,7 @@ class SeabornChatVisualizer(Visualizer):
                     or pd.api.types.is_categorical_dtype(series)
                     or pd.api.types.is_string_dtype(series)
                 ):
-                    errors.append(f"histplot x should be a single numeric/categorical column, but {plan.x} is not suitable.")
+                    errors.append(f"histogram x should be a single numeric/categorical column, but {plan.x} is not suitable.")
         elif plan.kind == "countplot":
             if plan.x is None:
                 errors.append("countplot requires x.")
@@ -610,11 +624,18 @@ class SeabornChatVisualizer(Visualizer):
 
         return errors
 
-    def _normalize_chart_plan(self, request: str, df: pd.DataFrame, plan: ChartPlan) -> ChartPlan:
+    def _normalize_chart_plan(
+        self,
+        request: str,
+        df: pd.DataFrame,
+        plan: ChartPlan,
+        *,
+        explicit_fields: dict[str, Any] | None = None,
+    ) -> ChartPlan:
         updates: dict[str, Any] = {}
         if plan.title is None:
             updates["title"] = self._default_chart_title(plan.kind)
-        explicit_fields = self._extract_explicit_field_constraints(request, df)
+        explicit_fields = dict(explicit_fields or self._extract_explicit_field_constraints(request, df))
         if explicit_fields.get("show_value_labels") and plan.show_value_labels is not True:
             updates["show_value_labels"] = True
         if plan.category_order == [] and explicit_fields.get("category_order"):
@@ -631,7 +652,14 @@ class SeabornChatVisualizer(Visualizer):
     def _default_chart_title(kind: str) -> str:
         return kind.replace("plot", " plot").title()
 
-    def _plan_chart(self, request: str, df: pd.DataFrame, profile: dict[str, list[str]]) -> tuple[ChartPlan | None, dict[str, Any]]:
+    def _plan_chart(
+        self,
+        request: str,
+        df: pd.DataFrame,
+        profile: dict[str, list[str]],
+        *,
+        explicit_fields: dict[str, Any] | None = None,
+    ) -> tuple[ChartPlan | None, dict[str, Any]]:
         debug: dict[str, Any] = {
             "planner": "llm_json",
             "planner_status": "planning_failed",
@@ -653,7 +681,7 @@ class SeabornChatVisualizer(Visualizer):
         if self._llm_config is None:
             debug["planner_error"] = "No llm_config available"
             return None, debug
-        explicit_contract = self._extract_explicit_field_constraints(request, df)
+        explicit_contract = dict(explicit_fields or self._extract_explicit_field_constraints(request, df))
         explicit_kind = explicit_contract.get("kind")
         debug["explicit_contract_kind"] = explicit_kind
         debug["explicit_fields"] = dict(explicit_contract)
@@ -679,15 +707,21 @@ class SeabornChatVisualizer(Visualizer):
         debug["parsed_plan"] = plan.model_dump(mode="json")
         debug["parsed_plan_kind"] = plan.kind
 
-        validation_errors = self._validate_chart_plan(request, df, plan)
+        try:
+            validation_errors = self._validate_chart_plan(request, df, plan, explicit_fields=explicit_contract)
+        except TypeError:
+            validation_errors = self._validate_chart_plan(request, df, plan)
         if validation_errors:
             debug["planner_status"] = "validation_failed"
             debug["validation_errors"] = list(validation_errors)
             debug["planner_error"] = "chart plan failed validation"
             return None, debug
 
-        plan = self._normalize_chart_plan(request, df, plan)
-        validation_errors = self._validate_chart_plan(request, df, plan)
+        plan = self._normalize_chart_plan(request, df, plan, explicit_fields=explicit_contract)
+        try:
+            validation_errors = self._validate_chart_plan(request, df, plan, explicit_fields=explicit_contract)
+        except TypeError:
+            validation_errors = self._validate_chart_plan(request, df, plan)
         if validation_errors:
             debug["planner_error"] = "final plan failed validation"
             debug["validation_errors"] = validation_errors
@@ -792,6 +826,7 @@ class SeabornChatVisualizer(Visualizer):
         return {"x": x, "y": y, "hue": hue, "variables": variables}
 
     def _render(self, kind: str, df: pd.DataFrame, columns: dict[str, Any]) -> Any:
+        _ensure_matplotlib_backend()
         if sns is not None:
             sns.set_theme(style="whitegrid")
         self._apply_cjk_font_defaults()
@@ -859,12 +894,7 @@ class SeabornChatVisualizer(Visualizer):
                             label_value = bar.get_width() if orientation == "horizontal" else bar.get_height()
                             if float(label_value) <= 0:
                                 continue
-                            if orientation == "horizontal":
-                                text_x = bar.get_x() + bar.get_width() / 2
-                                text_y = bar.get_y() + bar.get_height() / 2
-                            else:
-                                text_x = bar.get_x() + bar.get_width() / 2
-                                text_y = bar.get_y() + bar.get_height() / 2
+                            text_x, text_y = self._label_position(bar, orientation=orientation)
                             ax.text(text_x, text_y, f"{float(label_value):g}%", ha="center", va="center", fontsize=8, color="white")
                     cumulative = cumulative + segment
                 ax.legend(title=str(hue))
@@ -991,7 +1021,7 @@ class SeabornChatVisualizer(Visualizer):
                     sns.boxplot(data=data, x=x, y=y, ax=ax)
                 else:
                     groups = [group[y].dropna().tolist() for _, group in data.groupby(x, dropna=False)]
-                    ax.boxplot(groups, labels=[str(label) for label in data[x].dropna().astype("string").unique().tolist()])
+                    ax.boxplot(groups, tick_labels=[str(label) for label in data[x].dropna().astype("string").unique().tolist()])
             else:
                 data = df[y].dropna().tolist()
                 if sns is not None:
@@ -1018,7 +1048,7 @@ class SeabornChatVisualizer(Visualizer):
             if sns is not None:
                 sns.swarmplot(data=data, x=x, y=y, hue=hue if hue and hue not in {x, y} else None, ax=ax, size=3)
             else:
-                ax.scatter(range(len(data)), data[y], c="#4C72B0", s=20)
+                self._fallback_categorical_scatter(ax, data, x=x, y=y, hue=hue if hue and hue not in {x, y} else None, size=20)
         elif kind == "stripplot":
             fig, ax = plt.subplots(figsize=(8, 4.5))
             if x is None or y is None:
@@ -1027,7 +1057,7 @@ class SeabornChatVisualizer(Visualizer):
             if sns is not None:
                 sns.stripplot(data=data, x=x, y=y, hue=hue if hue and hue not in {x, y} else None, ax=ax, jitter=True, size=3, alpha=0.7)
             else:
-                ax.scatter(range(len(data)), data[y], c="#4C72B0", s=16, alpha=0.7)
+                self._fallback_categorical_scatter(ax, data, x=x, y=y, hue=hue if hue and hue not in {x, y} else None, size=16, alpha=0.7)
         elif kind == "jointplot":
             if x is None or y is None:
                 raise ValueError("Need two numeric columns for jointplot")
@@ -1102,6 +1132,42 @@ class SeabornChatVisualizer(Visualizer):
             fig.suptitle(title)
         fig.tight_layout()
         return fig
+
+    @staticmethod
+    def _label_position(patch: Any, *, orientation: str = "vertical") -> tuple[float, float]:
+        if orientation == "horizontal":
+            return (patch.get_x() + patch.get_width(), patch.get_y() + patch.get_height() / 2)
+        return (patch.get_x() + patch.get_width() / 2, patch.get_y() + patch.get_height())
+
+    @staticmethod
+    def _categorical_positions(data: pd.DataFrame, category_column: str) -> tuple[pd.Series, list[str]]:
+        categories = [str(value) for value in data[category_column].astype("string").dropna().drop_duplicates().tolist()]
+        if not categories:
+            raise ValueError(f"No categorical values available for {category_column}")
+        mapping = {category: index for index, category in enumerate(categories)}
+        positions = data[category_column].astype("string").map(lambda item: mapping.get(str(item)))
+        return positions.astype(float), categories
+
+    @staticmethod
+    def _fallback_categorical_scatter(
+        ax: Axes,
+        data: pd.DataFrame,
+        *,
+        x: str,
+        y: str,
+        hue: str | None = None,
+        alpha: float = 0.7,
+        size: float = 16,
+    ) -> None:
+        positions, categories = SeabornChatVisualizer._categorical_positions(data, x)
+        if hue and hue in data.columns and data[hue].notna().any():
+            for hue_value, group in data.assign(_cat_pos=positions).groupby(hue, dropna=False):
+                ax.scatter(group["_cat_pos"], group[y], s=size, alpha=alpha, label=str(hue_value))
+            ax.legend(title=str(hue))
+        else:
+            ax.scatter(positions, data[y], c="#4C72B0", s=size, alpha=alpha)
+        ax.set_xticks(range(len(categories)))
+        ax.set_xticklabels(categories)
 
     @staticmethod
     def _annotate_bar_labels(ax: Axes, *, orientation: str = "vertical") -> None:
@@ -1194,6 +1260,24 @@ class SeabornChatVisualizer(Visualizer):
 
     def _result(self, request: str, df: pd.DataFrame | None, kind: str | None, text: str, plot: Any | None, columns: dict[str, Any]) -> SeabornChatResult:
         chart_debug = dict(columns.get("chart_debug") or {})
+        chart_plan = {
+            "kind": kind,
+            "x": columns.get("x"),
+            "y": columns.get("y"),
+            "hue": columns.get("hue"),
+            "value": columns.get("value"),
+            "orientation": columns.get("orientation"),
+            "stack_mode": columns.get("stack_mode"),
+            "normalize_mode": columns.get("normalize_mode"),
+            "category_order": list(columns.get("category_order") or []),
+            "explicit_fields": dict(columns.get("explicit_fields") or {}),
+            "source_result_id": columns.get("source_result_id"),
+            "source_df_role": columns.get("source_df_role"),
+            "confidence": columns.get("confidence"),
+            "planner_source": columns.get("planner_source"),
+            "sort_by": columns.get("sort_by"),
+            "sort_direction": columns.get("sort_direction"),
+        }
         meta = {
             VisualisationResult.META_PLOT_MESSAGES_KEY: [] if df is None else [
                 {"backend": "seaborn", "request": request, "kind": kind, "columns": columns}
@@ -1201,6 +1285,7 @@ class SeabornChatVisualizer(Visualizer):
             "plot_backend": "seaborn",
             "plot_kind": kind,
             "plot_config": columns,
+            "chart_plan": chart_plan,
             "planner": columns.get("planner"),
             "validated": columns.get("validated"),
             "repair_used": columns.get("repair_used"),
@@ -1224,10 +1309,11 @@ class SeabornChatVisualizer(Visualizer):
             text=text,
             meta=meta,
             plot=plot,
-            code=json.dumps({"backend": "seaborn", "kind": kind, "plot_config": columns}, indent=2),
+            code=json.dumps({"backend": "seaborn", "kind": kind, "plot_config": columns, "chart_plan": chart_plan}, indent=2),
             dataframe=df,
             kind=kind,
             plot_config=columns,
+            chart_plan=chart_plan,
             visualizer=self,
         )
 
@@ -1255,11 +1341,15 @@ class SeabornChatVisualizer(Visualizer):
                     "chart_debug": {"planner": "fallback", "planner_status": "no_data", "validated": False},
                 },
             )
-        profile = self._profile(data.df)
-        explicit_fields = self._extract_explicit_field_constraints(request, data.df)
-        plan, plan_debug = self._plan_chart(request, data.df, profile)
+        working_df, dataframe_debug = self._prepare_dataframe(data.df)
+        profile = self._profile(working_df)
+        explicit_fields = self._extract_explicit_field_constraints(request, working_df)
+        plan, plan_debug = self._plan_chart(request, working_df, profile, explicit_fields=explicit_fields)
         if plan is not None and plan_debug.get("validated"):
-            final_validation_errors = self._validate_chart_plan(request, data.df, plan)
+            try:
+                final_validation_errors = self._validate_chart_plan(request, working_df, plan, explicit_fields=explicit_fields)
+            except TypeError:
+                final_validation_errors = self._validate_chart_plan(request, working_df, plan)
             if final_validation_errors:
                 plan_debug["planner_status"] = "validation_failed"
                 plan_debug["validated"] = False
@@ -1278,6 +1368,8 @@ class SeabornChatVisualizer(Visualizer):
                     "normalize_mode": plan.normalize_mode,
                     "category_order": list(plan.category_order),
                     "explicit_fields": dict(plan.explicit_fields),
+                    "source_result_id": plan.source_result_id,
+                    "source_df_role": plan.source_df_role,
                     "planner_source": plan.planner_source or "llm_json",
                     "title": plan.title,
                     "show_value_labels": bool(plan.show_value_labels or explicit_fields.get("show_value_labels")),
@@ -1295,7 +1387,8 @@ class SeabornChatVisualizer(Visualizer):
                     "plot_error": None,
                 }
                 try:
-                    fig = self._render(plan.kind, data.df, columns)
+                    columns["dataframe_debug"] = dataframe_debug
+                    fig = self._render(plan.kind, working_df, columns)
                 except Exception as exc:
                     plan_debug["planner_status"] = "render_failed"
                     plan_debug["validated"] = False
@@ -1304,7 +1397,7 @@ class SeabornChatVisualizer(Visualizer):
                     logger.warning("LLM-planned chart failed to render: %s", exc)
                     return self._result(
                         request,
-                        data.df,
+                        working_df,
                         plan.kind,
                         f"Failed to render requested {plan.kind} chart: {exc}",
                         None,
@@ -1317,10 +1410,11 @@ class SeabornChatVisualizer(Visualizer):
                             "fallback_reason": None,
                             "fallback_blocked": True,
                             "plot_error": str(exc),
+                            "dataframe_debug": dataframe_debug,
                         },
                     )
                 else:
-                    return self._result(request, data.df, plan.kind, f"Rendered {plan.kind} chart via LLM-planned spec.", fig, columns)
+                    return self._result(request, working_df, plan.kind, f"Rendered {plan.kind} chart via LLM-planned spec.", fig, columns)
         planner_status = str(plan_debug.get("planner_status") or "planning_failed")
         fallback_allowed_status = {"planning_failed", "schema_parse_failed", "validation_failed"}
         explicit_percent_stacked = explicit_fields.get("stack_mode") == "percent_stacked"
@@ -1337,7 +1431,7 @@ class SeabornChatVisualizer(Visualizer):
             plan_debug["fallback_blocked"] = True
             return self._result(
                 request,
-                data.df,
+                working_df,
                 plan.kind if plan is not None else "barplot",
                 failure_text,
                 None,
@@ -1353,6 +1447,8 @@ class SeabornChatVisualizer(Visualizer):
                     "normalize_mode": "percent_of_group",
                     "category_order": list(plan.category_order) if plan is not None else list(explicit_fields.get("category_order") or []),
                     "explicit_fields": dict(plan.explicit_fields) if plan is not None else dict(explicit_fields),
+                    "source_result_id": plan.source_result_id if plan is not None else None,
+                    "source_df_role": plan.source_df_role if plan is not None else "plot_ready",
                     "planner_source": (plan.planner_source if plan is not None else "llm_json") or "llm_json",
                     "title": plan.title if plan is not None else None,
                     "show_value_labels": bool((plan.show_value_labels if plan is not None else False) or explicit_fields.get("show_value_labels")),
@@ -1368,6 +1464,7 @@ class SeabornChatVisualizer(Visualizer):
                     "render_error": plan_debug.get("render_error"),
                     "chart_debug": dict(plan_debug),
                     "plot_error": failure_text,
+                    "dataframe_debug": dataframe_debug,
                 },
             )
         if planner_status not in fallback_allowed_status:
@@ -1381,7 +1478,7 @@ class SeabornChatVisualizer(Visualizer):
             failed_kind = plan.kind if plan is not None else None
             return self._result(
                 request,
-                data.df,
+                working_df,
                 failed_kind,
                 failure_text,
                 None,
@@ -1397,6 +1494,8 @@ class SeabornChatVisualizer(Visualizer):
                     "normalize_mode": plan.normalize_mode if plan is not None else None,
                     "category_order": list(plan.category_order) if plan is not None else [],
                     "explicit_fields": dict(plan.explicit_fields) if plan is not None else dict(explicit_fields),
+                    "source_result_id": plan.source_result_id if plan is not None else None,
+                    "source_df_role": plan.source_df_role if plan is not None else "plot_ready",
                     "planner_source": (plan.planner_source if plan is not None else "llm_json") or "llm_json",
                     "title": plan.title if plan is not None else None,
                     "show_value_labels": bool((plan.show_value_labels if plan is not None else False) or explicit_fields.get("show_value_labels")),
@@ -1412,12 +1511,13 @@ class SeabornChatVisualizer(Visualizer):
                     "render_error": plan_debug.get("render_error"),
                     "chart_debug": dict(plan_debug),
                     "plot_error": failure_text,
+                    "dataframe_debug": dataframe_debug,
                 },
             )
 
         fallback_reason = plan_debug.get("planner_error") or "LLM planning unavailable"
         if plan is None or not plan_debug.get("validated"):
-            logger.warning("Falling back to legacy seaborn heuristics: %s", fallback_reason)
+            logger.warning("Falling back to seaborn heuristics: %s", fallback_reason)
         kind = self._choose_kind(request, profile)
         columns = self._pick_columns(kind, profile)
         columns.update(
@@ -1435,6 +1535,8 @@ class SeabornChatVisualizer(Visualizer):
                 "normalize_mode": "none",
                 "category_order": list(explicit_fields.get("category_order") or []),
                 "explicit_fields": dict(explicit_fields),
+                "source_result_id": None,
+                "source_df_role": "plot_ready",
                 "planner_source": "fallback",
                 "planner_status": "fallback",
                 "planner_error": plan_debug.get("planner_error"),
@@ -1451,9 +1553,9 @@ class SeabornChatVisualizer(Visualizer):
             }
         )
         if kind is None:
-            return self._result(request, data.df, None, "Failed to infer a chart kind for the provided dataframe.", None, columns)
+            return self._result(request, working_df, None, "Failed to infer a chart kind for the provided dataframe.", None, columns)
         try:
-            fig = self._render(kind, data.df, columns)
+            fig = self._render(kind, working_df, columns)
         except Exception as exc:
             logger.warning("Failed to render seaborn chart: %s", exc)
             columns["render_error"] = str(exc)
@@ -1463,8 +1565,8 @@ class SeabornChatVisualizer(Visualizer):
             chart_debug["planner_status"] = "render_failed"
             chart_debug["show_value_labels"] = bool(columns.get("show_value_labels"))
             columns["chart_debug"] = chart_debug
-            return self._result(request, data.df, kind, f"Failed to visualize request! Output: {exc}", None, columns)
-        return self._result(request, data.df, kind, f"Rendered {kind} chart via fallback.", fig, columns)
+            return self._result(request, working_df, kind, f"Failed to visualize request! Output: {exc}", None, columns)
+        return self._result(request, working_df, kind, f"Rendered {kind} chart via fallback.", fig, columns)
 
     def edit(self, request: str, visualization: VisualisationResult, *, stream: bool = False) -> SeabornChatResult:
         if not isinstance(visualization, SeabornChatResult):

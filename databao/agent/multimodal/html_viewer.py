@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from databao.agent.multimodal.utils import dataframe_to_csv
-from databao.agent.visualizers.vega_chat import VegaChatResult
 
 if TYPE_CHECKING:
     from databao.agent.core.thread import Thread
@@ -108,14 +107,13 @@ class MultimodalHTTPRequestHandler(BaseHTTPRequestHandler):
             try:
                 plot = self.thread.plot()
 
-                if not isinstance(plot, VegaChatResult):
-                    raise ValueError(f"Plot requires VegaChatVisualizer, got {type(plot).__name__}")
-
-                if plot.spec is None or plot.spec_df is None:
+                png_bytes = getattr(plot, "png_bytes", None)
+                if not callable(png_bytes):
+                    raise ValueError(f"Plot requires a PNG-capable chart result, got {type(plot).__name__}")
+                image_bytes = png_bytes()
+                if not image_bytes:
                     raise ValueError("Failed to generate visualization")
-
-                spec_csv_data = dataframe_to_csv(plot.spec_df)
-                result = {"spec": plot.spec, "csvData": spec_csv_data}
+                result = {"imageBytesHex": image_bytes.hex(), "csvData": dataframe_to_csv(self.thread.df())}
 
                 result_queue.put(result)
 
@@ -188,10 +186,10 @@ class MultimodalHTTPRequestHandler(BaseHTTPRequestHandler):
 
 
 def open_html_content(thread: "Thread") -> str:
-    """Create an HTML file with the embedded Vega spec and open it in the browser.
+    """Create an HTML file with the embedded chart content and open it in the browser.
 
     This function starts a temporary HTTP server, opens the HTML content in the browser,
-    and closes the server after spec generation.
+    and closes the server after chart generation.
 
     Args:
         thread: The databao thread.

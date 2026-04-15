@@ -283,11 +283,8 @@ def _numeric_parse_success(series: pd.Series) -> tuple[float, float, float]:
         return 0.0, float(numeric_like.mean()), 0.0
     parsed = pd.to_numeric(normalized.where(numeric_like), errors="coerce")
     success_rate = float(parsed.notna().sum() / max(numeric_like.sum(), 1))
-    integer_like = (
-        parsed.dropna().map(lambda value: float(value).is_integer())
-        if not parsed.dropna().empty
-        else pd.Series(dtype=bool)
-    )
+    parsed_non_null = parsed.dropna()
+    integer_like = (parsed_non_null % 1 == 0) if not parsed_non_null.empty else pd.Series(dtype=bool)
     integer_like_ratio = float(integer_like.mean()) if not integer_like.empty else 0.0
     return success_rate, float(numeric_like.mean()), integer_like_ratio
 
@@ -312,9 +309,8 @@ def _coerce_numeric(series: pd.Series) -> tuple[pd.Series | None, bool]:
     parsed = pd.to_numeric(normalized.where(numeric_like), errors="coerce")
     if parsed.notna().sum() == 0:
         return None, False
-    all_integer_like = bool(
-        numeric_like.fillna(False).all() and parsed.dropna().map(lambda value: float(value).is_integer()).all()
-    )
+    parsed_non_null = parsed.dropna()
+    all_integer_like = bool(numeric_like.fillna(False).all() and (parsed_non_null % 1 == 0).all())
     return parsed, all_integer_like
 
 

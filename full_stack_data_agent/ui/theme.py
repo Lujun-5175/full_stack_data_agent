@@ -451,7 +451,6 @@ def get_ui_css() -> str:
 
       [data-testid="stMarkdownContainer"] img,
       .stImage img,
-      .vega-embed,
       canvas {
         max-width: 100% !important;
         border-radius: 14px;

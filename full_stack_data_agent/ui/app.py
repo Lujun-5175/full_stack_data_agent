@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import streamlit as st
 
 from full_stack_data_agent.bootstrap import bootstrap
+from full_stack_data_agent.app.conversation_export import build_conversation_export_bundle
 from full_stack_data_agent.config.settings import get_settings
 from full_stack_data_agent.context.models import UploadedFileContext
 from full_stack_data_agent.context.upload_processor import SUPPORTED_UPLOAD_EXTENSIONS, process_uploaded_file
@@ -23,22 +24,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-st.set_page_config(page_title="Full Stack Data Agent", layout="wide", initial_sidebar_state="collapsed")
-st.markdown(get_ui_css(), unsafe_allow_html=True)
-
-settings = get_settings()
+def configure_page() -> None:
+    st.set_page_config(page_title="Full Stack Data Agent", layout="wide", initial_sidebar_state="collapsed")
+    st.markdown(get_ui_css(), unsafe_allow_html=True)
 
 
 @st.cache_resource
 def _create_service() -> "ChatService":
-    return bootstrap(settings)
+    return bootstrap(get_settings())
 
 
-service = _create_service()
+def get_service() -> "ChatService":
+    return _create_service()
 
 
 def _init_session_state() -> None:
+    service = get_service()
     defaults = {
         "conversation_state": service.create_state(),
         "last_result": None,
@@ -110,6 +111,7 @@ def _clear_uploads() -> None:
 
 
 def _submit_prompt(prompt: str, conversation_mount: Any) -> None:
+    service = get_service()
     message = prompt.strip()
     if not message:
         return
@@ -150,6 +152,7 @@ def _submit_prompt(prompt: str, conversation_mount: Any) -> None:
 
 
 def _clear_chat() -> None:
+    service = get_service()
     previous_state = st.session_state.conversation_state
     service.drop_session(previous_state.conversation_id)
     st.session_state.conversation_state = service.create_state()
@@ -162,6 +165,7 @@ def _clear_chat() -> None:
 
 
 def _render_sidebar(status: Any) -> None:
+    settings = get_settings()
     sidebar_class = "sidebar-shell" if st.session_state.sidebar_open else "sidebar-shell sidebar-shell--collapsed"
     st.markdown(f'<div class="{sidebar_class}">', unsafe_allow_html=True)
 
@@ -213,15 +217,59 @@ def _render_sidebar(status: Any) -> None:
         render_runtime_snapshot(status, st.session_state.conversation_state, len(st.session_state.uploaded_contexts))
 
     with st.expander("Settings", expanded=False):
+        provider_label = escape(str(status.provider))
+        model_label = escape(str(status.model))
+        fallback_label = escape(str(getattr(status, "fallback_provider", None) or "--"))
         st.markdown(
             f"""
             <div class="settings-list">
-              <div><strong>Provider</strong><span>{status.provider}</span></div>
-              <div><strong>Model</strong><span>{status.model}</span></div>
-              <div><strong>Fallback</strong><span>{getattr(status, 'fallback_provider', None) or '--'}</span></div>
+              <div><strong>Provider</strong><span>{provider_label}</span></div>
+              <div><strong>Model</strong><span>{model_label}</span></div>
+              <div><strong>Fallback</strong><span>{fallback_label}</span></div>
             </div>
             """,
             unsafe_allow_html=True,
+        )
+
+    with st.expander("Export", expanded=False):
+        st.caption("Export the current conversation as a reviewer-friendly bundle.")
+        include_full_metadata = st.checkbox("Include full metadata", value=True, key="export-include-full-metadata")
+        include_trace = st.checkbox("Include trace", value=True, key="export-include-trace")
+        include_plot_specs = st.checkbox("Include plot specs", value=True, key="export-include-plot-specs")
+        compact_markdown_preview = st.checkbox("Compact markdown preview", value=False, key="export-compact-markdown")
+
+        export_bundle = build_conversation_export_bundle(
+            st.session_state.conversation_state,
+            session_context={
+                "provider_status": status,
+                "last_result": st.session_state.last_result,
+                "uploaded_contexts": st.session_state.uploaded_contexts,
+                "settings": settings,
+                "last_runtime_snapshot": getattr(st.session_state.last_result, "thread_meta", None) if st.session_state.last_result else None,
+            },
+            include_full_metadata=include_full_metadata,
+            include_workspace=True,
+            include_grounding=True,
+            include_bindings=True,
+            include_completion_validation=True,
+            include_normalization=True,
+            include_registered_tables=True,
+            include_trace=include_trace,
+            include_errors=True,
+            include_chart_summaries=True,
+            include_plot_specs=include_plot_specs,
+            max_markdown_table_rows=12 if compact_markdown_preview else 30,
+        )
+        st.download_button(
+            "Export Full Bundle (.zip)",
+            data=export_bundle.zip_bytes,
+            file_name=export_bundle.archive_name,
+            mime="application/zip",
+            use_container_width=True,
+            key="export-full-bundle",
+        )
+        st.caption(
+            f"Includes {len(export_bundle.turn_json_map)} turn JSON files, markdown, plain text, workspace index, binding index, and error summary."
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -279,11 +327,12 @@ def _render_composer() -> tuple[bool, bool]:
 
 
 def main() -> None:
+    configure_page()
     _init_session_state()
     _sync_uploaded_contexts()
     _apply_pending_ui_resets()
 
-    status = service.provider_status()
+    status = get_service().provider_status()
     sidebar_ratio = [0.26, 0.74] if st.session_state.sidebar_open else [0.08, 0.92]
     sidebar_col, main_col = st.columns(sidebar_ratio, gap="medium")
 
@@ -303,6 +352,3 @@ def main() -> None:
         if send_clicked:
             _submit_prompt(st.session_state.composer_text, conversation_mount)
             st.rerun()
-
-
-main()

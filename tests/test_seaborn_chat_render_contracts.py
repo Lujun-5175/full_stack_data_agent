@@ -212,3 +212,71 @@ def test_g5_same_grouped_result_can_render_percent_stacked_view(monkeypatch) -> 
     assert result.plot_config["stack_mode"] == "percent_stacked"
     assert result.plot_config["normalize_mode"] == "percent_of_group"
     assert result.meta["chart_debug"]["stack_mode"] == "percent_stacked"
+
+
+def test_violinplot_kind_is_allowed_and_rendered(monkeypatch) -> None:
+    visualizer = SeabornChatVisualizer(llm_config=object())
+    dataframe = pd.DataFrame({"Contract": ["A", "A", "B", "B"], "value": [1.0, 2.0, 3.0, 4.0]})
+    plan = {
+        "kind": "violinplot",
+        "x": "Contract",
+        "y": "value",
+        "hue": None,
+        "value": None,
+        "orientation": None,
+        "stack_mode": "none",
+        "normalize_mode": "none",
+        "category_order": [],
+        "show_value_labels": False,
+        "explicit_fields": {"requested_x": "Contract", "requested_y": "value"},
+        "confidence": "high",
+    }
+    monkeypatch.setattr(visualizer, "_call_chart_planner", lambda messages: json.dumps(plan))
+
+    result = visualizer.visualize("画小提琴图，横轴：Contract，纵轴：value", ExecutionResult(text="ok", meta={}, df=dataframe))
+
+    assert result.kind == "violinplot"
+    assert result.chart_plan["kind"] == "violinplot"
+
+
+def test_heatmap_kind_is_allowed_and_rendered(monkeypatch) -> None:
+    visualizer = SeabornChatVisualizer(llm_config=object())
+    dataframe = pd.DataFrame({"a": [1, 2, 3], "b": [2, 3, 4], "c": [3, 4, 5]})
+    plan = {
+        "kind": "heatmap",
+        "x": None,
+        "y": None,
+        "hue": None,
+        "value": None,
+        "orientation": None,
+        "stack_mode": "none",
+        "normalize_mode": "none",
+        "category_order": [],
+        "show_value_labels": False,
+        "explicit_fields": {},
+        "variables": ["a", "b", "c"],
+        "confidence": "high",
+    }
+    monkeypatch.setattr(visualizer, "_call_chart_planner", lambda messages: json.dumps(plan))
+
+    result = visualizer.visualize("画热力图", ExecutionResult(text="ok", meta={}, df=dataframe))
+
+    assert result.kind == "heatmap"
+    assert result.chart_plan["kind"] == "heatmap"
+
+
+def test_percent_stacked_label_position_distinguishes_orientation() -> None:
+    visualizer = SeabornChatVisualizer()
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    try:
+        vertical = ax.bar(["A"], [50])[0]
+        x1, y1 = visualizer._label_position(vertical, orientation="vertical")
+        ax.clear()
+        horizontal = ax.barh(["A"], [50])[0]
+        x2, y2 = visualizer._label_position(horizontal, orientation="horizontal")
+    finally:
+        plt.close(fig)
+
+    assert x1 != x2 or y1 != y2

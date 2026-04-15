@@ -9,6 +9,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from databao.agent.visualizers.chart_contract import ChartRequest
+from databao.agent.visualizers.chart_registry import canonicalize_chart_kind
+from full_stack_data_agent.utils.json_extract import extract_first_json_object
 
 
 DEEPSEEK_SYSTEM_PROMPT = dedent(
@@ -27,6 +29,7 @@ DEEPSEEK_SYSTEM_PROMPT = dedent(
     5. 不要虚构任何列名，字段名必须来自 available_columns。
     6. 如果用户明确指定了图类型、x、y、hue、方向、是否堆叠、是否百分比堆叠，必须优先遵守。
     7. 如果用户没有明确指定图类型，选择最合理、最保守的图表类型。
+    7a. 允许的图类型只有：histogram、countplot、barplot、lineplot、scatterplot、boxplot、violinplot、swarmplot、stripplot、jointplot、pairplot、heatmap。
     8. 如果是横向柱状图，必须输出 "orientation": "horizontal"。
     9. 如果是普通竖向柱状图，输出 "orientation": "vertical"。
     10. 如果是 100% 堆叠柱状图，必须输出：
@@ -60,7 +63,7 @@ DEEPSEEK_SYSTEM_PROMPT = dedent(
     你输出的 JSON 必须符合这个结构：
 
     {
-      "kind": "barplot|lineplot|scatterplot|boxplot|histplot|countplot",
+      "kind": "histogram|countplot|barplot|lineplot|scatterplot|boxplot|violinplot|swarmplot|stripplot|jointplot|pairplot|heatmap",
       "x": "列名或 null",
       "y": "列名或 null",
       "hue": "列名或 null",
@@ -101,6 +104,7 @@ RUNTIME_USER_PROMPT_TEMPLATE = dedent(
     - 如果当前 dataframe_role 是 grouped / aggregated / plot_ready，请优先把它视为“已经准备好画图的数据”，不要假设还需要重新聚合
     - 如果用户明确说“横轴/纵轴/分组颜色”，请严格遵守
     - 如果用户明确说“按占比/百分比/100%堆叠”，请不要输出普通 barplot 语义
+    - 所有图类型别名都要归一成 canonical kind；例如 histplot 必须输出为 histogram
     - 只输出 JSON
     """
 ).strip()
@@ -113,45 +117,8 @@ class ChartPlanningError:
     raw_response: str | None = None
     details: dict[str, Any] | None = None
 
-
-def _extract_first_json_object(text: str) -> str | None:
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-                continue
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : index + 1]
-        start = text.find("{", start + 1)
-    return None
-
-
 def _safe_json_loads(text: str) -> dict[str, Any] | None:
-    candidate = _extract_first_json_object(text)
-    if candidate is None:
-        return None
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    return extract_first_json_object(text)
 
 
 def _validate_columns(parsed: dict[str, Any], available_columns: list[str]) -> list[str]:
@@ -179,8 +146,9 @@ def _normalize_confidence(parsed: dict[str, Any]) -> None:
 
 
 def _normalize_kind(parsed: dict[str, Any]) -> None:
-    if str(parsed.get("kind") or "").lower() == "histogram":
-        parsed["kind"] = "histplot"
+    kind = canonicalize_chart_kind(parsed.get("kind"))
+    if kind is not None:
+        parsed["kind"] = kind
 
 
 def plan_chart_request(

@@ -56,6 +56,7 @@ class ProviderHealth:
     fallback_provider: str | None = None
     fallback_connected: bool | None = None
     fallback_error: str | None = None
+    failure_category: str | None = None
     latency_ms: int | None = None
     error: str | None = None
     checked_at: float = field(default_factory=time)

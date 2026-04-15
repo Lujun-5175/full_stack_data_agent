@@ -11,7 +11,7 @@ def test_deliverable_extraction_filters_punctuation_only_chunks() -> None:
         "\u8bf7\u56de\u7b54\uff1a\u6a2a\u8f74\uff1a Churn\uff0c\u7eb5\u8f74\uff1a\u5ba2\u6237\u6570\u91cf\uff0c\u6bcf\u4e2a\u67f1\u5b50\u4e0a\u663e\u793a\u4eba\u6570\uff0c\u6700\u540e\u7528 2 \u53e5\u8bdd\u8bf4\u660e\u8c01\u66f4\u591a\u3002"
     )
 
-    assert debug["source"] == "legacy_fallback"
+    assert debug["source"] == "heuristic_local"
     assert all(clause.strip() not in {":", "\uff1a"} for clause in clauses)
     assert any("\u6bcf\u4e2a\u67f1\u5b50\u4e0a\u663e\u793a\u4eba\u6570" in clause for clause in clauses)
 

@@ -82,6 +82,7 @@ def test_llm_chart_request_json_parses_for_horizontal_bar(monkeypatch: pytest.Mo
     assert plan is not None
     assert plan.orientation == "horizontal"
     assert plan.planner_source == "llm_json"
+    assert plan.kind == "barplot"
 
 
 def test_llm_chart_request_json_parses_for_grouped_bar(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,6 +189,8 @@ def test_llm_json_plan_does_not_get_semantically_rewritten_by_fallback(monkeypat
     assert result.kind == "barplot"
     assert result.plot_config["orientation"] == "horizontal"
     assert result.plot_config["stack_mode"] == "none"
+    assert result.chart_plan["kind"] == "barplot"
+    assert result.meta["chart_plan"]["orientation"] == "horizontal"
 
 
 def test_plot_like_handles_figure_and_axes_without_requested_bug() -> None:
@@ -229,6 +232,17 @@ def test_extract_explicit_constraints_maps_100_percent_stacked_semantics() -> No
 
     assert explicit["stack_mode"] == "percent_stacked"
     assert explicit["normalize_mode"] == "percent_of_group"
+
+
+def test_result_exposes_serializable_chart_plan() -> None:
+    visualizer = SeabornChatVisualizer()
+    result = visualizer.visualize(
+        "show a histogram with x=value",
+        ExecutionResult(text="ok", meta={}, df=pd.DataFrame({"value": [1, 2, 3, 4]})),
+    )
+
+    assert result.chart_plan["kind"] == "histogram"
+    assert result.meta["chart_plan"] == result.chart_plan
 
 
 def test_explicit_percent_stacked_request_blocks_semantic_fallback(monkeypatch: pytest.MonkeyPatch) -> None:

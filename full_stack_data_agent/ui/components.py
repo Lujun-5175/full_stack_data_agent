@@ -8,17 +8,12 @@ from html import escape
 from types import SimpleNamespace
 from typing import Any
 
-import altair as alt
-import pandas as pd
 import streamlit as st
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-from databao.agent.visualizers.vega_vis_tool import VegaVisTool
 from full_stack_data_agent.context.models import ConversationState, ConversationTurn, UploadedFileContext
 from full_stack_data_agent.llm.models import ProviderHealth
-
-_CHART_MIN_HEIGHT = 360
 _PROFILE_VALUE_PREVIEW_LIMIT = 10
 
 
@@ -143,6 +138,149 @@ def _response_payload_dict(response: Any | None) -> dict[str, Any]:
     return {}
 
 
+def _workspace_from_response(response: Any | None) -> dict[str, Any]:
+    raw_response = _response_payload(response)
+    workspace_obj = getattr(raw_response, "result_workspace", None) if raw_response is not None else None
+    if workspace_obj is not None:
+        to_dict = getattr(workspace_obj, "to_dict", None)
+        if callable(to_dict):
+            converted = to_dict()
+            if isinstance(converted, dict):
+                return converted
+    payload = _response_payload_dict(raw_response)
+    workspace = payload.get("result_workspace")
+    return workspace if isinstance(workspace, dict) else {}
+
+
+def _grounded_response_from_response(response: Any | None) -> dict[str, Any]:
+    raw_response = _response_payload(response)
+    grounded_obj = getattr(raw_response, "grounded_response", None) if raw_response is not None else None
+    if grounded_obj is not None:
+        to_dict = getattr(grounded_obj, "to_dict", None)
+        if callable(to_dict):
+            converted = to_dict()
+            if isinstance(converted, dict):
+                return converted
+    payload = _response_payload_dict(raw_response)
+    grounded = payload.get("grounded_response")
+    return grounded if isinstance(grounded, dict) else {}
+
+
+def _workspace_artifact_index(response: Any | None) -> dict[str, dict[str, Any]]:
+    workspace = _workspace_from_response(response)
+    return {
+        str(artifact.get("artifact_id")): artifact
+        for artifact in workspace.get("artifacts", [])
+        if isinstance(artifact, dict) and artifact.get("artifact_id")
+    }
+
+
+def _workspace_runtime_artifact(response: Any | None, artifact_id: str | None) -> Any | None:
+    raw_response = _response_payload(response)
+    workspace_obj = getattr(raw_response, "result_workspace", None) if raw_response is not None else None
+    resolve_artifact = getattr(workspace_obj, "resolve_artifact", None)
+    if callable(resolve_artifact) and artifact_id:
+        try:
+            return resolve_artifact(str(artifact_id))
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_primary_chart_artifact(response: Any | None) -> dict[str, Any] | None:
+    grounded = _grounded_response_from_response(response)
+    artifact_id = grounded.get("primary_chart_artifact_id")
+    if not artifact_id:
+        artifact_id = _response_payload_dict(_response_payload(response)).get("primary_chart_artifact_id")
+    return _workspace_artifact_index(response).get(str(artifact_id)) if artifact_id else None
+
+
+def _resolve_primary_table_artifact(response: Any | None) -> dict[str, Any] | None:
+    grounded = _grounded_response_from_response(response)
+    artifact_id = grounded.get("primary_table_artifact_id")
+    if not artifact_id:
+        artifact_id = _response_payload_dict(_response_payload(response)).get("primary_table_artifact_id")
+    return _workspace_artifact_index(response).get(str(artifact_id)) if artifact_id else None
+
+
+def _artifact_preview_rows(artifact: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(artifact, dict):
+        return []
+    preview = artifact.get("dataframe_preview")
+    return preview if isinstance(preview, list) else []
+
+
+def _render_chart_from_runtime_handle(runtime_artifact: Any, chart_debug: dict[str, Any]) -> bool:
+    runtime_handle = None
+    runtime_handle_getter = getattr(runtime_artifact, "runtime_handle", None)
+    if callable(runtime_handle_getter):
+        runtime_handle = runtime_handle_getter("chart_runtime_object") or runtime_handle_getter("plot_result")
+    else:
+        runtime_handle = getattr(runtime_artifact, "runtime_handles", {}).get("chart_runtime_object") or getattr(runtime_artifact, "runtime_handles", {}).get("plot_result")
+    if runtime_handle is None:
+        return False
+
+    try:
+        plot = getattr(runtime_handle, "plot", None)
+        if plot is not None:
+            matplotlib_plot = _as_matplotlib_figure(plot)
+            if matplotlib_plot is not None:
+                chart_debug["chart_renderable"] = True
+                chart_debug["chart_renderer"] = "pyplot"
+                chart_debug["chart_type"] = type(plot).__name__
+                st.pyplot(matplotlib_plot, use_container_width=True)
+                return True
+
+        matplotlib_plot = _as_matplotlib_figure(runtime_handle)
+        if matplotlib_plot is not None:
+            chart_debug["chart_renderable"] = True
+            chart_debug["chart_renderer"] = "pyplot"
+            chart_debug["chart_type"] = type(runtime_handle).__name__
+            st.pyplot(matplotlib_plot, use_container_width=True)
+            return True
+
+        png_bytes = getattr(runtime_handle, "png_bytes", None)
+        if callable(png_bytes):
+            image_bytes = png_bytes()
+            if image_bytes:
+                chart_debug["chart_renderable"] = True
+                chart_debug["chart_renderer"] = "image"
+                chart_debug["chart_type"] = type(runtime_handle).__name__
+                st.image(image_bytes, use_container_width=True)
+                return True
+    except Exception as exc:
+        chart_debug["chart_failure_stage"] = "ui_render_failed"
+        chart_debug["chart_failure_reason"] = str(exc)
+        st.error(f"Chart render failed: {exc}")
+        return False
+    return False
+
+
+def _render_chart_from_artifact_payload(
+    chart_artifact: dict[str, Any] | None,
+    *,
+    runtime_artifact: Any | None,
+    chart_debug: dict[str, Any],
+) -> bool:
+    if chart_artifact is None:
+        return False
+    render_payload = chart_artifact.get("render_payload") if isinstance(chart_artifact.get("render_payload"), dict) else {}
+    render_kind = str(render_payload.get("render_kind") or "")
+    chart_meta = chart_artifact.get("chart_meta") if isinstance(chart_artifact.get("chart_meta"), dict) else {}
+
+    image_payload = render_payload.get("plot_image_base64") or chart_meta.get("plot_image_base64") or ((chart_artifact.get("metadata") or {}).get("plot_image_base64") if isinstance(chart_artifact.get("metadata"), dict) else None)
+    if image_payload:
+        chart_debug["chart_renderable"] = True
+        chart_debug["chart_renderer"] = "image_base64"
+        chart_debug["chart_type"] = render_payload.get("plot_kind") or render_payload.get("plot_backend") or "image"
+        if _render_plot_image_base64(str(image_payload)):
+            return True
+
+    if render_kind in {"runtime_handle", "plot_attr", "matplotlib_figure", "matplotlib_axes", "unknown"} and runtime_artifact is not None:
+        return _render_chart_from_runtime_handle(runtime_artifact, chart_debug)
+    return False
+
+
 def _chart_debug_from_response(response: Any | None) -> dict[str, Any]:
     payload = _response_payload_dict(_response_payload(response))
     chart_debug = payload.get("chart_debug")
@@ -160,26 +298,6 @@ def _chart_failed_upstream(chart_debug: dict[str, Any] | None) -> bool:
     }
 
 
-def _ensure_chart_height(chart: Any, *, minimum_height: int = _CHART_MIN_HEIGHT) -> Any:
-    to_dict = getattr(chart, "to_dict", None)
-    if callable(to_dict):
-        try:
-            chart_dict = to_dict()
-            if isinstance(chart_dict, dict) and chart_dict.get("height") is None:
-                return chart.properties(height=minimum_height)
-            return chart
-        except Exception:
-            pass
-
-    height = getattr(chart, "height", None)
-    if height is None:
-        try:
-            return chart.properties(height=minimum_height)
-        except Exception:
-            return chart
-    return chart
-
-
 def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | None = None) -> bool:
     response = _response_payload(result)
     if response is None:
@@ -190,29 +308,20 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
     if _chart_failed_upstream(chart_debug):
         return False
 
-    plot_object = getattr(response, "plot_object", None)
+    chart_artifact = _resolve_primary_chart_artifact(result)
+    grounded = _grounded_response_from_response(result)
+    runtime_chart_artifact = _workspace_runtime_artifact(result, grounded.get("primary_chart_artifact_id"))
+    if chart_artifact is not None:
+        if _render_chart_from_artifact_payload(
+            chart_artifact,
+            runtime_artifact=runtime_chart_artifact,
+            chart_debug=chart_debug,
+        ):
+            return True
+
+    plot_object = response.get("plot_object") if isinstance(response, dict) else getattr(response, "plot_object", None)
     if plot_object is not None:
         try:
-            altair_builder = getattr(plot_object, "altair", None)
-            if callable(altair_builder):
-                chart = _ensure_chart_height(altair_builder())
-                if chart is not None:
-                    chart_debug["chart_renderable"] = True
-                    chart_debug["chart_renderer"] = "altair_chart"
-                    chart_debug["chart_type"] = type(chart).__name__
-                    st.altair_chart(chart, use_container_width=True)
-                    return True
-
-            to_altair_chart = getattr(plot_object, "to_altair_chart", None)
-            if callable(to_altair_chart):
-                chart = _ensure_chart_height(to_altair_chart())
-                if chart is not None:
-                    chart_debug["chart_renderable"] = True
-                    chart_debug["chart_renderer"] = "altair_chart"
-                    chart_debug["chart_type"] = type(chart).__name__
-                    st.altair_chart(chart, use_container_width=True)
-                    return True
-
             plot = getattr(plot_object, "plot", None)
             if plot is not None:
                 matplotlib_plot = _as_matplotlib_figure(plot)
@@ -222,11 +331,6 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
                     chart_debug["chart_type"] = type(plot).__name__
                     st.pyplot(matplotlib_plot, use_container_width=True)
                     return True
-                chart_debug["chart_renderable"] = True
-                chart_debug["chart_renderer"] = "altair_chart"
-                chart_debug["chart_type"] = type(plot).__name__
-                st.altair_chart(_ensure_chart_height(plot), use_container_width=True)
-                return True
         except Exception as exc:
             chart_debug["chart_failure_stage"] = "ui_render_failed"
             chart_debug["chart_failure_reason"] = str(exc)
@@ -267,30 +371,9 @@ def _render_chart_from_response(result: Any, *, chart_debug: dict[str, Any] | No
         if _render_plot_image_base64(str(plot_image_base64), mime_type=response_dict.get("plot_image_mime_type")):
             return True
 
-    plot_spec = response_dict.get("plot_spec")
-    plot_data = response_dict.get("plot_data")
-    if not plot_spec or not plot_data:
-        chart_debug["chart_failure_stage"] = "history_payload_validation"
-        chart_debug["chart_failure_reason"] = (
-            f"plot_spec={'present' if plot_spec else 'missing'}, plot_data={'present' if plot_data else 'missing'}"
-        )
-        return False
-
-    try:
-        dataframe = pd.DataFrame(plot_data)
-        prepared_spec = VegaVisTool.prepare_spec(plot_spec, dataframe)
-        chart = alt.Chart.from_dict(prepared_spec, validate=False)
-        chart_debug["chart_renderable"] = True
-        chart_debug["chart_renderer"] = "altair_chart_from_spec"
-        chart_debug["chart_type"] = str(plot_spec.get("mark") or "vega-lite")
-        st.altair_chart(_ensure_chart_height(chart), use_container_width=True)
-        return True
-    except Exception as exc:
-        chart_debug["chart_failure_stage"] = "ui_render_failed"
-        chart_debug["chart_failure_reason"] = str(exc)
-        chart_debug["plot_spec_dump"] = plot_spec
-        st.error(f"Chart render failed: {exc}")
-        return False
+    chart_debug["chart_failure_stage"] = "history_payload_validation"
+    chart_debug["chart_failure_reason"] = "No renderable matplotlib/image chart payload was available."
+    return False
 
 
 def _registered_table_lookup(result: Any | None) -> dict[str, dict[str, Any]]:
@@ -427,21 +510,42 @@ def render_runtime_snapshot(status: ProviderHealth, state: ConversationState, up
 
 
 def _message_tables(metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    preview = metadata.get("dataframe_preview") or []
+    artifact_lookup = {
+        str(artifact.get("artifact_id")): artifact
+        for artifact in metadata.get("result_workspace", {}).get("artifacts", [])
+        if isinstance(artifact, dict) and artifact.get("artifact_id")
+    } if isinstance(metadata.get("result_workspace"), dict) else {}
+    grounded = metadata.get("grounded_response") if isinstance(metadata.get("grounded_response"), dict) else {}
+    table_artifact = artifact_lookup.get(str(grounded.get("primary_table_artifact_id") or metadata.get("primary_table_artifact_id") or ""))
+    preview = _artifact_preview_rows(table_artifact) or metadata.get("dataframe_preview") or []
     if not preview:
         return []
     return [
         {
             "label": "Table preview",
             "rows": preview,
-            "row_count": metadata.get("row_count"),
-            "columns": metadata.get("columns") or [],
+            "row_count": (table_artifact or {}).get("row_count") or metadata.get("row_count"),
+            "columns": (table_artifact or {}).get("columns") or metadata.get("columns") or [],
         }
     ]
 
 
 def _message_artifacts(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
+    workspace = metadata.get("result_workspace")
+    grounded = metadata.get("grounded_response")
+    if workspace:
+        artifacts.append({"label": "Result Workspace", "value": workspace})
+    if grounded:
+        artifacts.append({"label": "Grounded Response", "value": grounded})
+    primary_bindings = {
+        "primary_artifact_id": metadata.get("primary_artifact_id"),
+        "primary_table_artifact_id": metadata.get("primary_table_artifact_id"),
+        "primary_chart_artifact_id": metadata.get("primary_chart_artifact_id"),
+        "followup_target_artifact_id": metadata.get("followup_target_artifact_id"),
+    }
+    if any(primary_bindings.values()):
+        artifacts.append({"label": "Primary Bindings", "value": primary_bindings})
     for key in ("completion_validation", "normalization_reports", "registered_tables"):
         value = metadata.get(key)
         if value:
@@ -466,10 +570,10 @@ def build_message_views(state: ConversationState) -> list[MessageView]:
         if turn.assistant_message is None:
             continue
         metadata = turn.metadata if isinstance(turn.metadata, dict) else {}
+        grounded = metadata.get("grounded_response") if isinstance(metadata.get("grounded_response"), dict) else {}
         chart_requested = any(
             [
-                metadata.get("plot_spec"),
-                metadata.get("plot_data"),
+                grounded.get("primary_chart_artifact_id"),
                 metadata.get("plot_image_base64"),
                 metadata.get("plot_backend"),
                 metadata.get("plot_object"),
@@ -637,22 +741,24 @@ def render_result_panel(result: Any | None) -> None:
     response_dict = _response_payload_dict(response)
     if response_dict.get("text"):
         st.markdown(response_dict["text"])
-    if response_dict.get("dataframe_preview"):
+    table_artifact = _resolve_primary_table_artifact(result)
+    preview_rows = _artifact_preview_rows(table_artifact) or response_dict.get("dataframe_preview")
+    if preview_rows:
         _render_table_renderer(
             {
                 "label": "Latest table preview",
-                "rows": response_dict["dataframe_preview"],
-                "row_count": response_dict.get("row_count"),
-                "columns": response_dict.get("columns") or [],
+                "rows": preview_rows,
+                "row_count": (table_artifact or {}).get("row_count") or response_dict.get("row_count"),
+                "columns": (table_artifact or {}).get("columns") or response_dict.get("columns") or [],
             },
             key_suffix="latest",
         )
     chart_debug = _chart_debug_from_response(response)
+    chart_artifact = _resolve_primary_chart_artifact(result)
     has_plot_object = getattr(response, "plot_object", None) is not None
     if (
         chart_debug.get("chart_requested")
-        or response_dict.get("plot_spec")
-        or response_dict.get("plot_data")
+        or chart_artifact is not None
         or response_dict.get("plot_image_base64")
         or response_dict.get("plot_backend")
         or has_plot_object

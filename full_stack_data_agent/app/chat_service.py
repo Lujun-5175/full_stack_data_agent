@@ -8,7 +8,7 @@ from full_stack_data_agent.app.databao_runtime import DatabaoRuntime
 from full_stack_data_agent.app.runtime_models import DatabaoSessionSnapshot, DatabaoTurnResult
 from full_stack_data_agent.config.settings import Settings
 from full_stack_data_agent.context.conversation_engine import ConversationEngine
-from full_stack_data_agent.context.models import ConversationState, UploadedFileContext
+from full_stack_data_agent.context.models import ConversationState, ConversationTurn, UploadedFileContext
 from full_stack_data_agent.llm.models import ProviderHealth
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,65 @@ class ChatService:
         state.debug_state["uploaded_contexts"] = uploaded_contexts
 
     @staticmethod
+    def _payload_to_dict(payload: Any | None) -> dict[str, Any]:
+        if payload is None:
+            return {}
+        if isinstance(payload, dict):
+            return payload
+        to_dict = getattr(payload, "to_dict", None)
+        if callable(to_dict):
+            converted = to_dict()
+            if isinstance(converted, dict):
+                return converted
+        return {}
+
+    @classmethod
+    def _project_metadata_payload(cls, last_result: DatabaoTurnResult) -> tuple[dict[str, Any], dict[str, Any]]:
+        workspace = cls._payload_to_dict(last_result.result_workspace)
+        grounded = cls._payload_to_dict(last_result.grounded_response)
+        artifacts = {
+            str(item.get("artifact_id")): item
+            for item in workspace.get("artifacts", [])
+            if isinstance(item, dict) and item.get("artifact_id")
+        }
+        table = artifacts.get(str(grounded.get("primary_table_artifact_id") or ""))
+        chart = artifacts.get(str(grounded.get("primary_chart_artifact_id") or ""))
+        render_payload = (chart or {}).get("render_payload") if isinstance((chart or {}).get("render_payload"), dict) else {}
+        projected = {
+            "dataframe_preview": (table or {}).get("dataframe_preview") or last_result.dataframe_preview,
+            "plot_plan": render_payload.get("chart_plan") or (chart or {}).get("chart_plan") or last_result.plot_plan,
+            "plot_spec": render_payload.get("chart_spec") or (chart or {}).get("chart_spec") or last_result.plot_spec,
+            "plot_data": render_payload.get("chart_data") or (chart or {}).get("chart_data") or last_result.plot_data,
+            "plot_meta": render_payload.get("chart_meta") or (chart or {}).get("chart_meta") or last_result.plot_meta,
+            "plot_backend": render_payload.get("plot_backend") or ((chart or {}).get("metadata") or {}).get("plot_backend") or last_result.plot_backend,
+            "plot_kind": render_payload.get("plot_kind") or ((chart or {}).get("metadata") or {}).get("plot_kind") or last_result.plot_kind,
+            "plot_image_base64": render_payload.get("plot_image_base64") or ((chart or {}).get("metadata") or {}).get("plot_image_base64") or last_result.plot_image_base64,
+            "plot_error": render_payload.get("plot_error") or ((chart or {}).get("metadata") or {}).get("plot_error") or last_result.plot_error,
+        }
+        return workspace, grounded | projected
+
+    @staticmethod
+    def _build_error_debug_payload(
+        error: str,
+        provider_status: ProviderHealth,
+        uploaded_contexts: list[UploadedFileContext] | None,
+    ) -> dict[str, Any]:
+        return {
+            "error": error,
+            "provider_status": provider_status.to_dict(),
+            "uploaded_contexts": [
+                {
+                    "file_name": item.file_name,
+                    "table_name": item.table_name,
+                    "is_tabular": item.is_tabular,
+                    "row_count": item.row_count,
+                    "columns": item.columns,
+                }
+                for item in (uploaded_contexts or [])
+            ],
+        }
+
+    @staticmethod
     def _build_turn_metadata(
         provider_status: ProviderHealth,
         last_result: DatabaoTurnResult,
@@ -52,6 +111,7 @@ class ChatService:
         *,
         stream_mode: str,
     ) -> dict[str, Any]:
+        workspace, grounded_projection = ChatService._project_metadata_payload(last_result)
         return {
             "provider": last_result.provider_used or provider_status.provider,
             "model": last_result.model_used or provider_status.model,
@@ -64,18 +124,41 @@ class ChatService:
             "executor_type": runtime_snapshot.executor_type,
             "row_count": last_result.row_count,
             "columns": last_result.columns or [],
-            "dataframe_preview": last_result.dataframe_preview,
+            "dataframe_preview": grounded_projection.get("dataframe_preview"),
             "plot_code": last_result.plot_code,
-            "plot_spec": last_result.plot_spec,
-            "plot_data": last_result.plot_data,
-            "plot_meta": last_result.plot_meta,
-            "plot_backend": last_result.plot_backend,
-            "plot_kind": last_result.plot_kind,
-            "plot_image_base64": last_result.plot_image_base64,
+            "plot_plan": grounded_projection.get("plot_plan"),
+            "plot_spec": grounded_projection.get("plot_spec"),
+            "plot_data": grounded_projection.get("plot_data"),
+            "plot_meta": grounded_projection.get("plot_meta"),
+            "plot_backend": grounded_projection.get("plot_backend"),
+            "plot_kind": grounded_projection.get("plot_kind"),
+            "plot_image_base64": grounded_projection.get("plot_image_base64"),
             "plot_image_mime_type": last_result.plot_image_mime_type,
-            "plot_error": last_result.plot_error,
+            "plot_error": grounded_projection.get("plot_error"),
             "chart_debug": last_result.chart_debug,
             "completion_validation": last_result.completion_validation,
+            "result_workspace": workspace,
+            "grounded_response": ChatService._payload_to_dict(last_result.grounded_response),
+            "primary_artifact_id": last_result.primary_artifact_id,
+            "primary_table_artifact_id": last_result.primary_table_artifact_id,
+            "primary_chart_artifact_id": last_result.primary_chart_artifact_id,
+            "followup_target_artifact_id": last_result.followup_target_artifact_id,
+            "binding_intent": last_result.binding_intent or {},
+            "binding_bundle": last_result.binding_bundle or {},
+            "binding_decisions": last_result.binding_decisions or {},
+            "decision_mode": last_result.decision_mode,
+            "llm_used": last_result.llm_used,
+            "turn_failure_state": last_result.turn_failure_state,
+            "failure_reason": last_result.failure_reason,
+            "business_result_present": last_result.business_result_present,
+            "query_obligations": last_result.thread_meta.get("query_obligations"),
+            "parsed_sql_summary": last_result.thread_meta.get("parsed_sql_summary"),
+            "sql_guardrail_report": last_result.thread_meta.get("sql_guardrail_report"),
+            "execution_validation_report": last_result.thread_meta.get("execution_validation_report"),
+            "sql_retry_history": last_result.thread_meta.get("sql_retry_history"),
+            "final_guardrail_status": last_result.thread_meta.get("final_guardrail_status"),
+            "repair_attempts": last_result.thread_meta.get("repair_attempts"),
+            "final_failure_reason": last_result.thread_meta.get("final_failure_reason"),
             "registered_tables": [table.to_dict() for table in runtime_snapshot.registered_tables],
             "normalization_reports": runtime_snapshot.normalization_reports,
             "status": "complete" if stream_mode == "one_shot" else "streaming",
@@ -103,11 +186,28 @@ class ChatService:
             "plot_kind": last_result.plot_kind,
             "plot_image_base64": last_result.plot_image_base64,
             "plot_image_mime_type": last_result.plot_image_mime_type,
+            "plot_plan": last_result.plot_plan,
             "plot_spec": last_result.plot_spec,
             "plot_data": last_result.plot_data,
             "plot_error": last_result.plot_error,
             "chart_debug": last_result.chart_debug,
             "completion_validation": last_result.completion_validation,
+            "binding_intent": last_result.binding_intent,
+            "binding_bundle": last_result.binding_bundle,
+            "binding_decisions": last_result.binding_decisions,
+            "decision_mode": last_result.decision_mode,
+            "llm_used": last_result.llm_used,
+            "turn_failure_state": last_result.turn_failure_state,
+            "failure_reason": last_result.failure_reason,
+            "business_result_present": last_result.business_result_present,
+            "query_obligations": last_result.thread_meta.get("query_obligations"),
+            "parsed_sql_summary": last_result.thread_meta.get("parsed_sql_summary"),
+            "sql_guardrail_report": last_result.thread_meta.get("sql_guardrail_report"),
+            "execution_validation_report": last_result.thread_meta.get("execution_validation_report"),
+            "sql_retry_history": last_result.thread_meta.get("sql_retry_history"),
+            "final_guardrail_status": last_result.thread_meta.get("final_guardrail_status"),
+            "repair_attempts": last_result.thread_meta.get("repair_attempts"),
+            "final_failure_reason": last_result.thread_meta.get("final_failure_reason"),
             "used_databao": last_result.used_databao,
             "thread_reset_reason": runtime_snapshot.thread_reset_reason,
             "datasource_changed": runtime_snapshot.datasource_changed,
@@ -200,20 +300,7 @@ class ChatService:
                     "status": "error",
                 },
             )
-            last_debug_detailed = {
-                "error": error,
-                "provider_status": provider_status.to_dict(),
-                "uploaded_contexts": [
-                    {
-                        "file_name": item.file_name,
-                        "table_name": item.table_name,
-                        "is_tabular": item.is_tabular,
-                        "row_count": item.row_count,
-                        "columns": item.columns,
-                    }
-                    for item in uploaded_contexts or []
-                ],
-            }
+            last_debug_detailed = self._build_error_debug_payload(error, provider_status, uploaded_contexts)
             state.turns[-1].debug_detailed = last_debug_detailed
 
         result = ChatServiceResult(
@@ -332,20 +419,7 @@ class ChatService:
                         },
                         status="error",
                     )
-                    last_debug_detailed = {
-                        "error": error,
-                        "provider_status": provider_status.to_dict(),
-                        "uploaded_contexts": [
-                            {
-                                "file_name": item.file_name,
-                                "table_name": item.table_name,
-                                "is_tabular": item.is_tabular,
-                                "row_count": item.row_count,
-                                "columns": item.columns,
-                            }
-                            for item in uploaded_contexts or []
-                        ],
-                    }
+                    last_debug_detailed = self._build_error_debug_payload(error, provider_status, uploaded_contexts)
                     state.turns[-1].debug_detailed = last_debug_detailed
                 else:
                     error = "Streaming finished without a final result"
@@ -362,20 +436,7 @@ class ChatService:
                         },
                         status="error",
                     )
-                    last_debug_detailed = {
-                        "error": error,
-                        "provider_status": provider_status.to_dict(),
-                        "uploaded_contexts": [
-                            {
-                                "file_name": item.file_name,
-                                "table_name": item.table_name,
-                                "is_tabular": item.is_tabular,
-                                "row_count": item.row_count,
-                                "columns": item.columns,
-                            }
-                            for item in uploaded_contexts or []
-                        ],
-                    }
+                    last_debug_detailed = self._build_error_debug_payload(error, provider_status, uploaded_contexts)
                     state.turns[-1].debug_detailed = last_debug_detailed
             except Exception as exc:
                 error = str(exc)
@@ -392,20 +453,7 @@ class ChatService:
                     },
                     status="error",
                 )
-                last_debug_detailed = {
-                    "error": error,
-                    "provider_status": provider_status.to_dict(),
-                    "uploaded_contexts": [
-                        {
-                            "file_name": item.file_name,
-                            "table_name": item.table_name,
-                            "is_tabular": item.is_tabular,
-                            "row_count": item.row_count,
-                            "columns": item.columns,
-                        }
-                        for item in uploaded_contexts or []
-                    ],
-                }
+                last_debug_detailed = self._build_error_debug_payload(error, provider_status, uploaded_contexts)
                 state.turns[-1].debug_detailed = last_debug_detailed
             finally:
                 state.debug_state["_active_stream_status"] = "complete" if error is None else "error"

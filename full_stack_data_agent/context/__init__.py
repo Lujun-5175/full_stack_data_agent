@@ -1,1 +1,1 @@
-"""Conversation and context packet layer."""
+"""Conversation state and uploaded-context support layer."""

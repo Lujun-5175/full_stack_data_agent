@@ -2,6 +2,10 @@
 
 import sys
 import types
+import json
+import threading
+import time
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -179,7 +183,7 @@ def test_llm_config_can_resolve_ollama_fallback(monkeypatch) -> None:
         assert llm_config.api_base_url is None
         assert llm_config.use_responses_api is False
         assert llm_config.ollama_pull_model is False
-        assert llm_config.model_kwargs["num_ctx"] == get_settings().ollama_num_ctx
+        assert llm_config.model_kwargs["num_ctx"] == get_settings().llm_num_ctx
     finally:
         get_settings.cache_clear()
 
@@ -219,6 +223,19 @@ def test_runtime_registers_uploaded_dataframe_and_reuses_thread_when_signature_u
     assert len(runtime._sessions) == 1
     assert first_snapshot.datasource_changed is False
     assert second_snapshot.datasource_changed is False
+    assert second_result.result_workspace is not None
+    assert second_result.grounded_response is not None
+    assert second_result.primary_table_artifact_id is not None
+    assert second_result.thread_meta["result_workspace"]["artifacts"]
+    json.dumps(second_result.to_dict(), ensure_ascii=False)
+
+
+def test_plot_backend_prefers_chart_spec_or_matplotlib() -> None:
+    spec_like = SimpleNamespace(spec={"mark": "bar"}, spec_df=pd.DataFrame([{"x": 1}]))
+    image_like = SimpleNamespace(png_bytes=lambda: b"png")
+
+    assert DatabaoRuntime._plot_backend(spec_like) == "chart_spec"
+    assert DatabaoRuntime._plot_backend(image_like) == "matplotlib"
 
 
 def test_runtime_registers_full_csv_payload_instead_of_preview_markdown(monkeypatch) -> None:
@@ -589,6 +606,48 @@ def test_drop_session_removes_cached_runtime_state(monkeypatch) -> None:
     assert "session-drop" not in runtime._sessions
 
 
+def test_ensure_session_publish_is_thread_safe(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    created: list[str] = []
+    closed: list[str] = []
+
+    def _build_session(*args, **kwargs):
+        created.append(str(len(created)))
+        time.sleep(0.05)
+        session_id = f"session-{len(created)}"
+        return SimpleNamespace(
+            conversation_id="session-race",
+            provider_name="deepseek",
+            uploaded_signature=(),
+            context_replayed=False,
+            datasource_changed=False,
+            thread_reset_reason=None,
+            domain=SimpleNamespace(close=lambda: closed.append(f"{session_id}-domain")),
+            thread=SimpleNamespace(close=lambda: closed.append(f"{session_id}-thread")),
+            agent=SimpleNamespace(close=lambda: closed.append(session_id)),
+        )
+
+    monkeypatch.setattr(runtime, "_build_session", _build_session)
+
+    results: list[object] = []
+
+    def _worker() -> None:
+        results.append(runtime._ensure_session("session-race", uploaded_contexts=[]))
+
+    first = threading.Thread(target=_worker)
+    second = threading.Thread(target=_worker)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert len(results) == 2
+    assert runtime._sessions["session-race"] in results
+    assert runtime._sessions["session-race"] is results[-1] or runtime._sessions["session-race"] is results[0]
+    runtime.drop_session("session-race")
+    assert "session-race" not in runtime._sessions
+
+
 def test_runtime_normalizes_uploaded_dataframe_before_registration(monkeypatch) -> None:
     runtime = DatabaoRuntime(get_settings())
     fake_thread = FakeThread()
@@ -797,6 +856,71 @@ def test_runtime_replays_history_when_datasource_changes(monkeypatch) -> None:
     assert replay_cache["messages"][1].content == "analysis complete"
 
 
+def test_runtime_rebuilds_session_without_replay_when_uploaded_data_changes_but_history_is_empty(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+    first_thread = FakeThread()
+    second_thread = FakeThread()
+    first_domain = FakeDomain(supports_context=True)
+    second_domain = FakeDomain(supports_context=True)
+    domains = [first_domain, second_domain]
+    first_agent = FakeAgent(first_thread)
+    second_agent = FakeAgent(second_thread)
+    agents = [first_agent, second_agent]
+
+    monkeypatch.setattr(runtime, "_create_domain", lambda: domains.pop(0))
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: agents.pop(0))
+
+    first_upload = UploadedFileContext(
+        file_name="salary.csv",
+        mime_type="text/csv",
+        size_bytes=32,
+        summary="salary data",
+        extracted_text="borough,salary\nQueens,100\n",
+        tabular_payload="borough,salary\nQueens,100\n",
+        is_tabular=True,
+        table_name="salary",
+        row_count=1,
+        columns=["borough", "salary"],
+    )
+    second_upload = UploadedFileContext(
+        file_name="salary_v2.csv",
+        mime_type="text/csv",
+        size_bytes=40,
+        summary="salary data updated",
+        extracted_text="borough,salary\nQueens,100\nBronx,80\n",
+        tabular_payload="borough,salary\nQueens,100\nBronx,80\n",
+        is_tabular=True,
+        table_name="salary_v2",
+        row_count=2,
+        columns=["borough", "salary"],
+    )
+
+    runtime.ask("session-2b", "show salary by borough", uploaded_contexts=[first_upload])
+    _result, snapshot = runtime.ask(
+        "session-2b",
+        "plot salary by borough",
+        uploaded_contexts=[second_upload],
+        prior_turns=[],
+    )
+
+    assert snapshot.thread_reset_reason == "datasource_rebuilt"
+    assert snapshot.context_replayed is False
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (ValueError("deepseek output schema mismatch"), False),
+        (RuntimeError("api connection timeout to provider"), True),
+        (RuntimeError("ollama returned malformed sql"), False),
+    ],
+)
+def test_should_fallback_only_matches_infrastructure_markers(exc: Exception, expected: bool) -> None:
+    runtime = DatabaoRuntime(get_settings())
+
+    assert runtime._should_fallback(exc) is expected
+
+
 def test_domain_descriptions_are_deduped_across_rebuilds(monkeypatch) -> None:
     runtime = DatabaoRuntime(get_settings())
     first_domain = FakeDomain()
@@ -923,7 +1047,7 @@ def test_runtime_falls_back_to_regex_deliverable_extraction_when_llm_fails(monke
 
     assert clauses
     assert any("gender" in clause or "\u67f1\u72b6\u56fe" in clause for clause in clauses)
-    assert debug["source"] == "legacy_fallback"
+    assert debug["source"] == "heuristic_local"
     assert "error" in debug
 
 
@@ -962,7 +1086,7 @@ def test_runtime_falls_back_to_lexical_coverage_judge_when_llm_fails(monkeypatch
     )
 
     assert covered is True
-    assert debug["source"] == "lexical_fallback"
+    assert debug["source"] == "lexical_heuristic"
 
 
 def test_runtime_builds_follow_up_in_query_language(monkeypatch) -> None:
@@ -996,3 +1120,153 @@ def test_runtime_falls_back_to_chinese_follow_up_template_when_llm_fails(monkeyp
 
     assert follow_up is not None
     assert follow_up.startswith("\u8bf7\u53ea\u57fa\u4e8e\u540c\u4e00\u4e2a dataframe")
+
+
+def test_runtime_hard_stops_when_sql_guardrail_blocked(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+
+    class _BlockedThread(FakeThread):
+        def text(self) -> str:
+            return "SQL guardrail blocked query generation after 3 attempts."
+
+    thread = _BlockedThread()
+    fake_domain = FakeDomain()
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(thread))
+
+    result, _ = runtime.ask("session-guardrail", "please draw a chart for churn_rate by contract", uploaded_contexts=[])
+
+    assert result.turn_failure_state == "sql_guardrail_blocked"
+    assert result.business_result_present is False
+    assert result.primary_chart_artifact_id is None
+    assert result.chart_debug["chart_generation_called"] is False
+    assert result.completion_validation["status"] == "failed"
+    assert result.completion_validation["supplement_added"] is False
+    assert "couldn't complete this request" in result.text.lower() or "未能完成" in result.text
+
+
+def test_runtime_applies_controlled_chart_repair_once(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+
+    class _PlotResult:
+        def __init__(self, *, x_field: str, y_field: str) -> None:
+            self.code = '{"mark":"bar"}'
+            self.meta = {"kind": "bar", "chart_debug": {"planner_status": "ok"}}
+            self.spec = {
+                "mark": "bar",
+                "encoding": {
+                    "x": {"field": x_field, "type": "nominal"},
+                    "y": {"field": y_field, "type": "quantitative"},
+                },
+            }
+            self.spec_df = pd.DataFrame(
+                [
+                    {"Contract": "Month-to-month", "churn_rate": 0.42, "total_customers": 100},
+                    {"Contract": "Two year", "churn_rate": 0.11, "total_customers": 140},
+                ]
+            )
+
+    class _RepairThread(FakeThread):
+        def plot(self, request=None, **kwargs):
+            self.plot_requests.append(request or "")
+            if len(self.plot_requests) == 1:
+                return _PlotResult(x_field="total_customers", y_field="Contract")
+            return _PlotResult(x_field="Contract", y_field="churn_rate")
+
+    dataframe = pd.DataFrame(
+        [
+            {"Contract": "Month-to-month", "churn_rate": 0.42, "total_customers": 100},
+            {"Contract": "Two year", "churn_rate": 0.11, "total_customers": 140},
+        ]
+    )
+    thread = _RepairThread(dataframe=dataframe)
+    fake_domain = FakeDomain()
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(thread))
+
+    result, _ = runtime.ask(
+        "session-chart-repair",
+        "Please draw a vertical bar chart with x=Contract and y=churn_rate, sorted by churn_rate desc.",
+        uploaded_contexts=[],
+    )
+
+    assert result.turn_failure_state is None
+    assert result.plot_spec is not None
+    assert result.plot_spec["encoding"]["x"]["field"] == "Contract"
+    assert result.plot_spec["encoding"]["y"]["field"] == "churn_rate"
+    assert result.chart_debug.get("chart_contract_repair_attempted") is True
+    assert result.chart_debug.get("chart_contract_repair_success") is True
+    assert len(thread.plot_requests) == 2
+
+
+def test_enforce_chart_contract_reads_chart_plan_from_seaborn_result() -> None:
+    runtime = DatabaoRuntime(get_settings())
+    dataframe = pd.DataFrame({"Contract": ["A", "B"], "customer_count": [1, 2]})
+    plot_result = types.SimpleNamespace(
+        chart_plan={
+            "kind": "barplot",
+            "x": "Contract",
+            "y": "customer_count",
+            "orientation": "vertical",
+            "stack_mode": "none",
+            "normalize_mode": "none",
+        },
+        plot_config={"kind": "barplot", "x": "Contract", "y": "customer_count"},
+        meta={"chart_debug": {"planner_status": "ready"}},
+    )
+
+    repaired, error, debug = runtime._enforce_chart_contract(  # type: ignore[attr-defined]
+        thread=FakeThread(dataframe=dataframe),
+        query="show a bar chart with x=Contract and y=customer_count",
+        chart_requested=True,
+        dataframe=dataframe,
+        plot_result=plot_result,
+        plot_error=None,
+        turn_failure_state=None,
+    )
+
+    assert repaired is plot_result
+    assert error is None
+    assert debug["chart_contract_validation"]["status"] == "matched"
+
+
+def test_runtime_blocks_chart_when_contract_mismatch_not_repairable(monkeypatch) -> None:
+    runtime = DatabaoRuntime(get_settings())
+
+    class _BadPlotResult:
+        def __init__(self) -> None:
+            self.code = '{"mark":"bar"}'
+            self.meta = {"kind": "bar"}
+            self.spec = {
+                "mark": "bar",
+                "encoding": {
+                    "x": {"field": "category", "type": "nominal"},
+                    "y": {"field": "count", "type": "quantitative"},
+                },
+            }
+            self.spec_df = pd.DataFrame([{"category": "分析状态", "count": 1}])
+
+    class _BadThread(FakeThread):
+        def plot(self, request=None, **kwargs):
+            self.plot_requests.append(request or "")
+            return _BadPlotResult()
+
+    dataframe = pd.DataFrame([{"category": "分析状态", "value": "数据库中没有客户数据"}])
+    thread = _BadThread(dataframe=dataframe, auto_visualization_result=None)
+    fake_domain = FakeDomain()
+    monkeypatch.setattr(runtime, "_create_domain", lambda: fake_domain)
+    monkeypatch.setattr(runtime, "_create_agent", lambda domain, llm_config: FakeAgent(thread))
+
+    result, _ = runtime.ask(
+        "session-chart-mismatch",
+        "Please draw a bar chart with x=Contract and y=churn_rate.",
+        uploaded_contexts=[],
+    )
+
+    assert result.turn_failure_state in {"diagnostic_only_result", "chart_generation_failed", "chart_planner_failed"}
+    assert result.primary_chart_artifact_id is None
+    assert result.plot_spec is None or result.plot_error
+    if result.turn_failure_state == "diagnostic_only_result":
+        assert result.chart_debug["chart_generation_called"] is False
+    else:
+        assert "chart_contract_mismatch" in str(result.plot_error or result.chart_debug.get("plot_error") or "")

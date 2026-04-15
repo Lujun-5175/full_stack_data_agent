@@ -61,9 +61,9 @@ def resolve_provider_config(settings: Settings, provider_name: str | None = None
             base_url=settings.deepseek_base_url.rstrip("/"),
             api_key_present=bool(api_key),
             fallback_provider=fallback_provider,
-            temperature=settings.ollama_temperature,
-            timeout=settings.ollama_timeout,
-            num_ctx=settings.ollama_num_ctx,
+            temperature=settings.llm_temperature,
+            timeout=settings.llm_timeout,
+            num_ctx=settings.llm_num_ctx,
             api_key=api_key,
         )
 
@@ -73,9 +73,9 @@ def resolve_provider_config(settings: Settings, provider_name: str | None = None
         base_url=settings.ollama_base_url.rstrip("/"),
         api_key_present=False,
         fallback_provider=fallback_provider,
-        temperature=settings.ollama_temperature,
-        timeout=settings.ollama_timeout,
-        num_ctx=settings.ollama_num_ctx,
+        temperature=settings.llm_temperature,
+        timeout=settings.llm_timeout,
+        num_ctx=settings.llm_num_ctx,
     )
 
 
@@ -101,26 +101,34 @@ def _probe_deepseek_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error="DEEPSEEK_API_KEY is missing.",
             api_key_present=False,
             fallback_provider=resolved.fallback_provider,
+            failure_category="auth",
         )
 
     headers = {"Authorization": f"Bearer {resolved.api_key}"}
+    models_url = f"{resolved.base_url}/v1/models"
     try:
         started = time.perf_counter()
         response = requests.get(
-            resolved.base_url,
+            models_url,
             headers=headers,
             timeout=min(float(resolved.timeout), 5.0),
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
-        if response.status_code in (401, 403):
+        if response.status_code == 200:
+            error = None
+            connected = True
+        elif response.status_code in (401, 403):
             error = "DeepSeek authentication failed."
             connected = False
+        elif response.status_code == 429:
+            error = "DeepSeek rate limited the request."
+            connected = True
         elif response.status_code >= 500:
             error = f"DeepSeek service returned {response.status_code}."
             connected = False
         else:
-            error = None
-            connected = True
+            error = f"DeepSeek service returned unexpected status {response.status_code}."
+            connected = False
         return ProviderHealth(
             provider=resolved.provider,
             base_url=resolved.base_url,
@@ -130,6 +138,13 @@ def _probe_deepseek_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error=error,
             api_key_present=True,
             fallback_provider=resolved.fallback_provider,
+            failure_category=(
+                None if response.status_code == 200 else
+                "auth" if response.status_code in (401, 403) else
+                "rate_limit" if response.status_code == 429 else
+                "transport" if response.status_code >= 500 else
+                "unavailable"
+            ),
             latency_ms=latency_ms,
         )
     except requests.Timeout as exc:
@@ -142,6 +157,7 @@ def _probe_deepseek_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error=f"DeepSeek request timed out: {exc}",
             api_key_present=True,
             fallback_provider=resolved.fallback_provider,
+            failure_category="timeout",
         )
     except requests.RequestException as exc:
         return ProviderHealth(
@@ -153,6 +169,7 @@ def _probe_deepseek_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error=f"DeepSeek is unavailable: {exc}",
             api_key_present=True,
             fallback_provider=resolved.fallback_provider,
+            failure_category="transport",
         )
 
 
@@ -175,6 +192,7 @@ def _probe_ollama_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error=error,
             api_key_present=False,
             fallback_provider=resolved.fallback_provider,
+            failure_category=None if connected else "model_missing",
             latency_ms=latency_ms,
         )
     except requests.Timeout as exc:
@@ -187,6 +205,7 @@ def _probe_ollama_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error=f"Ollama request timed out: {exc}",
             api_key_present=False,
             fallback_provider=resolved.fallback_provider,
+            failure_category="timeout",
         )
     except requests.RequestException as exc:
         return ProviderHealth(
@@ -198,4 +217,5 @@ def _probe_ollama_health(resolved: ResolvedProviderConfig) -> ProviderHealth:
             error=f"Ollama is unavailable: {exc}",
             api_key_present=False,
             fallback_provider=resolved.fallback_provider,
+            failure_category="transport",
         )
